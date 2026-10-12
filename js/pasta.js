@@ -4,8 +4,26 @@
  * Android), o app continua usando baixar/compartilhar. */
 (function (g) {
   'use strict';
-  const suportada = typeof g.showDirectoryPicker === 'function';
-  const suportaSalvarComo = typeof g.showSaveFilePicker === 'function';
+  const FALHOU = 'cc-seletor-falhou';
+
+  /** Navegadores que rodam sobre o WebView do Android (DuckDuckGo e outros apps): a função
+   *  existe, mas o app hospedeiro não mostra o seletor e cancela na hora. */
+  function navegadorSemSeletor(ua) {
+    return /DuckDuckGo/i.test(ua) || /; wv\)/.test(ua);
+  }
+
+  let falhouAntes = false;
+  try { falhouAntes = localStorage.getItem(FALHOU) === '1'; } catch (e) { /* sem localStorage */ }
+  const bloqueado = navegadorSemSeletor(navigator.userAgent) || falhouAntes;
+  const suportada = !bloqueado && typeof g.showDirectoryPicker === 'function';
+  const suportaSalvarComo = !bloqueado && typeof g.showSaveFilePicker === 'function';
+
+  /** O seletor cancelou sozinho: não oferecer mais pasta nem "salvar como" neste navegador. */
+  function marcarSemSeletor() {
+    try { localStorage.setItem(FALHOU, '1'); } catch (e) { /* sem localStorage */ }
+    g.Pasta.suportada = false;
+    g.Pasta.suportaSalvarComo = false;
+  }
 
   let banco = null;
   function idb() {
@@ -89,5 +107,5 @@
     return h.name;
   }
 
-  g.Pasta = { suportada, suportaSalvarComo, chave, obter, escolher, esquecer, permitir, da, existe, gravar, listar, salvarComo };
+  g.Pasta = { suportada, suportaSalvarComo, navegadorSemSeletor, marcarSemSeletor, chave, obter, escolher, esquecer, permitir, da, existe, gravar, listar, salvarComo };
 })(window);

@@ -1043,8 +1043,86 @@
     };
   }
 
-  /** Monta o workbook .xlsx formatado: Chamada, Lista de presença, Notas, Cronograma, Alunos, Observações, Configuração.
-   *  opcoes.lista = { titulo, data, extras } para o cabeçalho da lista de presença. */
+  /* ---------- lista de presença: quem entra ---------- */
+
+  const fmtN = v => numBR(v, v % 1 ? 1 : 0);
+
+  /** Critérios para escolher quem entra na lista de presença (rótulos com os valores da turma). */
+  function criteriosLista(t) {
+    const c = t.config;
+    return {
+      ativos: 'Inscritos (quem passou do limite de faltas sai riscado)',
+      freq: 'Só inscritos com frequência suficiente',
+      vs: `Para a VS: média parcial de ${fmtN(c.mediaVS)} a menos de ${fmtN(c.mediaMin)}, com frequência`,
+      vr: 'Para a VR: sem nota em alguma prova já feita, com frequência',
+      todos: 'Inscritos e também os que saíram da turma',
+      faixa: 'Média parcial numa faixa…',
+      manual: 'Escolher à mão…'
+    };
+  }
+
+  /** Alunos da lista conforme o critério { tipo, min, max, freq, ids }, em ordem alfabética. */
+  function alunosParaLista(t, criterio) {
+    const c = Object.assign({ tipo: 'ativos', min: null, max: null, freq: true, ids: [] }, criterio);
+    const hoje = todayISO();
+    const comFreq = a => !reprovadoPorFalta(t, statsAluno(t, a).faltas);
+    const mp = a => mediaAluno(t, a);
+    const ativos = alunosOrdenados(t, false);
+    switch (c.tipo) {
+      case 'freq': return ativos.filter(comFreq);
+      case 'vs': return ativos.filter(a => comFreq(a) && mp(a) != null && mp(a) >= t.config.mediaVS && mp(a) < t.config.mediaMin);
+      case 'vr': {
+        const feitas = avaliacoesMedia(t).filter(v => v.data && v.data <= hoje);
+        return ativos.filter(a => comFreq(a) && feitas.some(v => notaDez(t, v, a) == null));
+      }
+      case 'todos': return sortAlunos(t.alunos);
+      case 'faixa': return ativos.filter(a => {
+        const m = mp(a);
+        return m != null && (c.min == null || m >= c.min) && (c.max == null || m < c.max) && (!c.freq || comFreq(a));
+      });
+      case 'manual': {
+        const ids = new Set(c.ids);
+        return sortAlunos(t.alunos.filter(a => ids.has(a.id)));
+      }
+      default: return ativos;
+    }
+  }
+
+  /** Lista de presença para assinatura: alunos escolhidos (riscado = passou do limite de faltas) + linhas em branco.
+   *  ol = { titulo, data, extras, criterio }. */
+  function dadosListaPresenca(t, cursos, ol) {
+    ol = Object.assign({ titulo: '', data: '', extras: 3, criterio: null }, ol);
+    const lim = limiteFaltas(t);
+    const tipo = (ol.criterio && ol.criterio.tipo) || 'ativos';
+    const linhas = alunosParaLista(t, ol.criterio).map(a => {
+      const i = infoMatricula(a.matricula, cursos);
+      const curso = i ? i.curso : '';
+      return {
+        matricula: a.matricula, nome: a.nome, curso: a.ativo ? curso : 'fora da lista' + (curso ? ' · ' + curso : ''),
+        risca: reprovadoPorFalta(t, statsAluno(t, a).faltas)
+      };
+    });
+    const n = linhas.length, riscados = linhas.filter(l => l.risca).length;
+    for (let i = 0; i < Math.max(0, ol.extras | 0); i++) linhas.push({ matricula: '', nome: '', curso: '', risca: false });
+    let criterio = '';
+    if (tipo === 'faixa') {
+      const c = ol.criterio;
+      criterio = 'média parcial' + (c.min != null ? ' ≥ ' + fmtN(c.min) : '') + (c.max != null ? (c.min != null ? ' e' : '') + ' < ' + fmtN(c.max) : '') + (c.freq ? ', com frequência' : '');
+    } else if (tipo === 'manual') criterio = 'escolhidos à mão';
+    else if (tipo !== 'ativos') { const r = criteriosLista(t)[tipo]; criterio = r.charAt(0).toLowerCase() + r.slice(1); }
+    return {
+      titulo: 'Lista de presença' + (ol.titulo ? ' — ' + ol.titulo : ''),
+      disciplina: t.disciplina,
+      info: [t.codigo && 'Código: ' + t.codigo, t.turma && 'Turma: ' + t.turma, t.periodo && 'Período: ' + periodoCurto(t.periodo)].filter(Boolean).join('     ·     '),
+      data: ol.data ? fmtDate(ol.data) : '',
+      linhas, n, riscados,
+      nota: (tipo === 'ativos' ? n + ' inscritos' : n + ' aluno(s)' + (criterio ? ' — ' + criterio : '')) +
+        (riscados ? ' · riscados: mais de ' + fmtN(lim) + ' faltas (25% de ' + aulasPrevistas(t) + ' aulas) em ' + fmtDate(todayISO()) : '')
+    };
+  }
+
+  /** Monta o workbook .xlsx formatado: Chamada, [Lista de presença], Notas, Estatísticas, Cronograma, Alunos,
+   *  Observações, Configuração. opcoes.lista = { titulo, data, extras } inclui a aba da lista de presença. */
   function montarPlanilha(XLSX, t, cursos, opcoes) {
     const U = XLSX.utils;
     const wb = U.book_new();
@@ -1122,50 +1200,43 @@
     if (alunos.length) ch['!autofilter'] = { ref: U.encode_range({ s: { r: H, c: 0 }, e: { r: H + alunos.length, c: cFreq } }) };
     U.book_append_sheet(wb, ch, 'Chamada');
 
-    // ---- Lista de presença (para assinatura em dia de prova)
+    // ---- Lista de presença (opcional, para assinatura em dia de prova)
     // Quem já passou do limite de faltas aparece com o nome riscado.
-    const lp = {};
-    const ol = Object.assign({ titulo: '', data: '', extras: 3 }, opcoes && opcoes.lista);
-    const ativos = alunos.filter(a => a.ativo);
-    const limTxt = numBR(limite, limite % 1 ? 1 : 0);
-    const textoLivre = (v, extra) => s(v, Object.assign({ font: Object.assign({ name: FONTE, sz: 11, color: { rgb: COR.texto } }, extra && extra.font) }, extra && extra.alignment ? { alignment: extra.alignment } : {}));
-    put(lp, 0, 0, s('Lista de presença' + (ol.titulo ? ' — ' + ol.titulo : ''), ST.titulo()));
-    put(lp, 1, 0, textoLivre(t.disciplina, { font: { bold: true } }));
-    put(lp, 2, 0, textoLivre([t.codigo && 'Código: ' + t.codigo, t.turma && 'Turma: ' + t.turma, t.periodo && 'Período: ' + t.periodo].filter(Boolean).join('     ·     ')));
-    put(lp, 3, 0, textoLivre('Data: ' + (ol.data ? fmtDate(ol.data) : '____/____/________'), { font: { bold: true } }));
-    put(lp, 3, 2, textoLivre('                         Professor(a): ______________________________'));
-    const LH = 5;
-    ['Nº', 'Matrícula', 'Nome', 'Curso', 'Assinatura'].forEach((h, c) => put(lp, LH, c, s(h, c === 2 ? ST.cabEsq() : ST.cab())));
-    let riscados = 0;
-    const linhasLista = ativos.length + Math.max(0, ol.extras | 0);
-    for (let i = 0; i < linhasLista; i++) {
-      const a = ativos[i];
-      const r = LH + 1 + i;
-      const risca = !!a && reprovadoPorFalta(t, statsDe[a.id].faltas);
-      if (risca) riscados++;
-      const fonte = risca ? { strike: true, color: { rgb: COR.inativo } } : {};
-      put(lp, r, 0, n(i + 1, corpo(i, false, { font: { sz: 9, color: { rgb: COR.cinza } }, alignment: { horizontal: 'center' } })));
-      put(lp, r, 1, s(a ? a.matricula : '', corpo(i, false, { font: Object.assign({ sz: 10 }, fonte), alignment: { horizontal: 'center' } })));
-      put(lp, r, 2, s(a ? a.nome : '', corpo(i, false, { font: Object.assign({ sz: 10 }, fonte), alignment: { wrapText: true } })));
-      put(lp, r, 3, s(a ? cursoDe(a) : '', corpo(i, false, { font: Object.assign({ sz: 7, color: { rgb: COR.cinza } }, fonte), alignment: { wrapText: true } })));
-      put(lp, r, 4, s('', corpo(i, false)));
+    if (opcoes && opcoes.lista) {
+      const lp = {};
+      const dl = dadosListaPresenca(t, cursos, opcoes.lista);
+      const textoLivre = (v, extra) => s(v, Object.assign({ font: Object.assign({ name: FONTE, sz: 11, color: { rgb: COR.texto } }, extra && extra.font) }, extra && extra.alignment ? { alignment: extra.alignment } : {}));
+      put(lp, 0, 0, s(dl.titulo, ST.titulo()));
+      put(lp, 1, 0, textoLivre(dl.disciplina, { font: { bold: true } }));
+      put(lp, 2, 0, textoLivre(dl.info));
+      put(lp, 3, 0, textoLivre('Data: ' + (dl.data || '____/____/________'), { font: { bold: true } }));
+      put(lp, 3, 2, textoLivre('                         Professor(a): ______________________________'));
+      const LH = 5;
+      ['Nº', 'Matrícula', 'Nome', 'Curso', 'Assinatura'].forEach((h, c) => put(lp, LH, c, s(h, c === 2 ? ST.cabEsq() : ST.cab())));
+      dl.linhas.forEach((l, i) => {
+        const r = LH + 1 + i;
+        const fonte = l.risca ? { strike: true, color: { rgb: COR.inativo } } : {};
+        put(lp, r, 0, n(i + 1, corpo(i, false, { font: { sz: 9, color: { rgb: COR.cinza } }, alignment: { horizontal: 'center' } })));
+        put(lp, r, 1, s(l.matricula, corpo(i, false, { font: Object.assign({ sz: 10 }, fonte), alignment: { horizontal: 'center' } })));
+        put(lp, r, 2, s(l.nome, corpo(i, false, { font: Object.assign({ sz: 10 }, fonte), alignment: { wrapText: true } })));
+        put(lp, r, 3, s(l.curso, corpo(i, false, { font: Object.assign({ sz: 7, color: { rgb: COR.cinza } }, fonte), alignment: { wrapText: true } })));
+        put(lp, r, 4, s('', corpo(i, false)));
+      });
+      const rNota = LH + 2 + dl.linhas.length;
+      put(lp, rNota, 0, s(dl.nota, ST.subtitulo()));
+      lp['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: rNota, c: 4 } });
+      // Larguras que cabem numa folha A4 em pé (margens de 1 cm); ajustáveis no Excel.
+      lp['!cols'] = [{ wch: 4 }, { wch: 10.5 }, { wch: 35 }, { wch: 12 }, { wch: 26 }];
+      lp['!rows'] = [{ hpt: 24 }, { hpt: 17 }, { hpt: 17 }, { hpt: 20 }, { hpt: 8 }, { hpt: 20 }];
+      for (let i = 0; i < dl.linhas.length; i++) lp['!rows'][LH + 1 + i] = { hpt: 26 };
+      lp['!margins'] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.25, footer: 0.25 };
+      U.book_append_sheet(wb, lp, 'Lista de presença');
+      // Repete o cabeçalho da tabela em cada página impressa.
+      wb.Workbook = wb.Workbook || {};
+      wb.Workbook.Names = (wb.Workbook.Names || []).concat([{
+        Name: '_xlnm.Print_Titles', Sheet: wb.SheetNames.length - 1, Ref: "'Lista de presença'!$" + (LH + 1) + ':$' + (LH + 1)
+      }]);
     }
-    const rNota = LH + 2 + linhasLista;
-    put(lp, rNota, 0, s(ativos.length + ' inscritos' +
-      (riscados ? ' · riscados: mais de ' + limTxt + ' faltas (25% de ' + aulasPrevistas(t) + ' aulas) em ' + fmtDate(todayISO()) : ''),
-      ST.subtitulo()));
-    lp['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: rNota, c: 4 } });
-    // Larguras que cabem numa folha A4 em pé (margens de 1 cm); ajustáveis no Excel.
-    lp['!cols'] = [{ wch: 4 }, { wch: 10.5 }, { wch: 35 }, { wch: 12 }, { wch: 26 }];
-    lp['!rows'] = [{ hpt: 24 }, { hpt: 17 }, { hpt: 17 }, { hpt: 20 }, { hpt: 8 }, { hpt: 20 }];
-    for (let i = 0; i < linhasLista; i++) lp['!rows'][LH + 1 + i] = { hpt: 26 };
-    lp['!margins'] = { left: 0.4, right: 0.4, top: 0.5, bottom: 0.5, header: 0.25, footer: 0.25 };
-    U.book_append_sheet(wb, lp, 'Lista de presença');
-    // Repete o cabeçalho da tabela em cada página impressa.
-    wb.Workbook = wb.Workbook || {};
-    wb.Workbook.Names = (wb.Workbook.Names || []).concat([{
-      Name: '_xlnm.Print_Titles', Sheet: wb.SheetNames.length - 1, Ref: "'Lista de presença'!$" + (LH + 1) + ':$' + (LH + 1)
-    }]);
 
     // ---- Notas: MP = média ponderada (escala 0–10, 1 casa); VR substitui a 1ª avaliação sem nota;
     // com VS no plano e MP entre mediaVS e mediaMin, MF = VS.
@@ -1402,9 +1473,39 @@
     return wb;
   }
 
-  function nomeArquivo(t, ext) {
-    const base = [t.periodo, t.codigo, t.turma].filter(Boolean).join('-') || norm(t.disciplina).replace(/\s+/g, '_');
-    return base.replace(/[^\w.-]+/g, '_') + '-chamada.' + ext;
+  const PALAVRAS_MENORES = new Set(['A', 'O', 'AS', 'OS', 'E', 'DE', 'DA', 'DO', 'DAS', 'DOS', 'EM', 'NA', 'NO', 'NAS', 'NOS', 'AO', 'AOS', 'PARA', 'COM', 'POR']);
+
+  /** Sigla da disciplina: "Linguagens Formais e Teoria da Computação" → "LFTC";
+   *  número ou romano no fim fica separado ("Programação de Computadores II" → "PC II"). */
+  function siglaDisciplina(nome) {
+    const originais = String(nome || '').split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const palavras = originais.map(w => norm(w));
+    let fim = '';
+    if (palavras.length > 1 && /^([IVX]+|\d+)$/.test(palavras[palavras.length - 1])) { fim = ' ' + palavras.pop(); originais.pop(); }
+    const sig = originais.filter((w, i) => !PALAVRAS_MENORES.has(palavras[i]));
+    if (!sig.length) return '';
+    return (sig.length === 1 ? titleCase(sig[0]).slice(0, 14) : sig.map(w => norm(w)[0]).join('').slice(0, 8)) + fim;
+  }
+
+  /** "2026/2", "2026.2", "2026 - 2" → "2026-2"; outros formatos ficam como estão. */
+  function periodoCurto(p) {
+    const s = String(p || '').trim();
+    let m = s.match(/(\d{4})\s*[./\-–]?\s*([12])(?!\d)/);
+    if (m) return m[1] + '-' + m[2];
+    m = s.match(/([12])\s*[º°ªo]?\s*sem\w*\.?\s*(?:de\s+)?(\d{4})/i);   // "2º semestre de 2026"
+    return m ? m[2] + '-' + m[1] : s;
+  }
+
+  /** Nome curto da turma (para arquivos): o que o professor definiu ou sigla + período, ex. "LFTC 2026-2". */
+  function nomeCurto(t) {
+    if (t.nomeCurto) return t.nomeCurto;
+    return [siglaDisciplina(t.disciplina) || t.codigo || 'Turma', periodoCurto(t.periodo)].filter(Boolean).join(' ');
+  }
+
+  /** Nome de arquivo legível: "LFTC 2026-2 - planilha.xlsx", "Chamada - backup 2026-10-12.json". */
+  function nomeArquivo(t, oque, ext) {
+    const nome = (t ? nomeCurto(t) : 'Chamada') + ' - ' + oque;
+    return nome.replace(/[\\/:*?"<>|]+/g, '-').replace(/\s+/g, ' ').trim() + '.' + ext;
   }
 
   g.CC = {
@@ -1416,6 +1517,6 @@
     avaliacoesMedia, avaliacaoTipo, sincronizarAvaliacoes, aplicarPlano, planoPadrao,
     levenshtein, casarTexto, digitosOCR,
     FILTROS, ORDENS, alunosVisao, situacaoNota, estatisticasNotas, CAMPOS_EMAIL, MODELOS_EMAIL, preencherModelo,
-    montarPlanilha, nomeArquivo, infoMatricula, cursosEncontrados, FORMAS_INGRESSO
+    montarPlanilha, dadosListaPresenca, criteriosLista, alunosParaLista, nomeArquivo, nomeCurto, siglaDisciplina, periodoCurto, infoMatricula, cursosEncontrados, FORMAS_INGRESSO
   };
 })(typeof window !== 'undefined' ? window : globalThis);

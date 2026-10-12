@@ -1,11 +1,12 @@
 /* Service worker: deixa o app funcionando sem internet. */
-const VERSAO = '0.3.1';
+const VERSAO = '0.4.0';
 const CACHE = 'chamada-' + VERSAO;
 const v = arq => arq + '?v=' + VERSAO;  // mesmos endereços usados no index.html
 const SHELL = [
   './', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
-  v('css/app.css'), v('js/cursos-uff.js'), v('js/core.js'), v('js/ocr.js'), v('js/pasta.js'), v('js/app.js'),
-  'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js'
+  v('css/app.css'), v('js/cursos-uff.js'), v('js/core.js'), v('js/ocr.js'), v('js/pasta.js'), v('js/lista-pdf.js'), v('js/app.js'),
+  'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'
 ];
 
 self.addEventListener('install', ev => {

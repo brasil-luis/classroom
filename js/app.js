@@ -10,7 +10,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.3.1';
+  const VERSAO = '0.4.0';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -189,8 +189,9 @@
       } catch (e) { return toast('Não consegui gravar na pasta: ' + e.message); }
     }
     if (r.acao === 'salvarcomo') {
+      const inicio = Date.now();
       try { const n = await Pasta.salvarComo(nome, blob, pasta && pasta.handle); return toast('Salvo: ' + n); }
-      catch (e) { if (e.name !== 'AbortError') toast('Não consegui salvar: ' + e.message); return; }
+      catch (e) { seletorFalhou(e, inicio, 'a janela para escolher onde salvar'); return; }
     }
     if (r.acao === 'compartilhar') {
       try { await navigator.share({ files: [file], title: nome }); } catch (e) { /* cancelado */ }
@@ -286,7 +287,7 @@
       <li><button value="importar">Importar planilha (nova turma)</button></li>
       <li><button value="vazia">Criar turma vazia</button></li>
       <li class="sep"></li>
-      <li><button value="pasta">Pasta de trabalho</button></li>
+      ${Pasta.suportada ? '<li><button value="pasta">Pasta de trabalho</button></li>' : ''}
       <li><button value="cursos">Códigos de curso</button></li>
       <li><button value="backup">Salvar backup (todas as turmas)</button></li>
       <li><button value="restaurar">Restaurar backup</button></li>
@@ -537,21 +538,21 @@
   function menuTurma(t) {
     dialogo(`<h2>${esc(CC.nomeTurma(t))}</h2><ul class="menu-list">
       <li><button value="exportar">Exportar planilha (.xlsx)</button></li>
-      <li><button value="presenca">Lista de presença para assinatura (na planilha)</button></li>
+      <li><button value="presenca">Lista de presença para assinatura (PDF ou planilha)</button></li>
       <li><button value="email">Enviar e-mail aos alunos</button></li>
       <li><button value="lista">Atualizar lista de alunos (planilha nova do sistema)</button></li>
       <li><button value="importar">Importar chamada / notas / cronograma de planilha</button></li>
       <li class="sep"></li>
       <li><button value="plano">Plano de avaliação</button></li>
       <li><button value="config">Configurações da turma</button></li>
-      <li><button value="pasta">Pasta de trabalho desta turma</button></li>
+      ${Pasta.suportada ? '<li><button value="pasta">Pasta de trabalho desta turma</button></li>' : ''}
       <li><button value="backup">Salvar backup desta turma</button></li>
       <li><button value="arquivar">${t.arquivada ? 'Desarquivar turma' : 'Arquivar turma (fim do período)'}</button></li>
       <li class="sep"></li>
       <li><button value="excluir" class="danger" style="color:var(--danger)">Excluir turma</button></li>
       </ul>`).then(r => {
-      if (r.acao === 'exportar') exportar(t, null);
-      if (r.acao === 'presenca') exportar(t, null);
+      if (r.acao === 'exportar') exportar(t);
+      if (r.acao === 'presenca') listaPresenca(t, null);
       if (r.acao === 'email') enviarEmail(t, null);
       if (r.acao === 'arquivar') alternarArquivo(t);
       if (r.acao === 'pasta') configurarPasta(t);
@@ -615,28 +616,111 @@
     toast(`${res.aulasNovas} aulas, ${res.marcacoes} marcações, ${res.notas} notas, ${res.alunosNovos} alunos novos`);
   }
 
-  /** Exporta a planilha; antes pergunta o cabeçalho da aba "Lista de presença". */
-  async function exportar(t, aula) {
-    if (!window.XLSX) return toast('Biblioteca de planilhas não carregou (abra o app uma vez com internet).');
-    if (!aula) {
-      const hoje = CC.todayISO();
-      aula = CC.aulasOrdenadas(t).find(a => a.tipo === 'avaliacao' && a.data >= hoje) || null;
-    }
-    const st = CC.alunosOrdenados(t, false).filter(a => CC.reprovadoPorFalta(t, CC.statsAluno(t, a).faltas)).length;
-    const r = await dialogo(`<h2>Exportar planilha</h2>
-      <p class="muted small">Abas: Chamada, Lista de presença, Notas, Cronograma, Alunos, Observações e Configuração.</p>
-      <div class="stack"><b class="small">Lista de presença (para assinatura)</b>
-      <label class="field">Título<input type="text" name="titulo" value="${esc(aula && aula.conteudo ? aula.conteudo : '')}" placeholder="ex.: P1 (pode deixar vazio)"></label>
+  /** Próxima avaliação (de hoje em diante): sugestão para o cabeçalho da lista de presença. */
+  function proximaAvaliacao(t) {
+    const hoje = CC.todayISO();
+    return CC.aulasOrdenadas(t).find(a => a.tipo === 'avaliacao' && a.data >= hoje) || null;
+  }
+
+  /** Campos da lista de presença: título, data, linhas em branco e quem entra (ligar com ligarLista). */
+  function camposLista(t, aula) {
+    const conteudo = aula && aula.conteudo ? aula.conteudo : '';
+    const sugerido = /^VS\b/i.test(conteudo) ? 'vs' : /^VR\b/i.test(conteudo) ? 'vr' : 'ativos';
+    const crit = CC.criteriosLista(t), c = t.config;
+    const todos = CC.alunosOrdenados(t, true);
+    return `<label class="field">Título<input type="text" name="titulo" value="${esc(conteudo)}" placeholder="ex.: P1 (pode deixar vazio)"></label>
       <div class="row nowrap"><label class="field grow">Data<input type="date" name="data" value="${aula ? aula.data : ''}"></label>
       <label class="field grow">Linhas em branco<input type="number" name="extras" min="0" max="40" value="3"></label></div>
-      <p class="muted small">${st ? `${st} aluno(s) com mais de ${CC.numBR(CC.limiteFaltas(t), CC.limiteFaltas(t) % 1 ? 1 : 0)} faltas aparecerão com o nome riscado.` : `Quem passar de ${CC.numBR(CC.limiteFaltas(t), CC.limiteFaltas(t) % 1 ? 1 : 0)} faltas aparece com o nome riscado.`}</p></div>
-      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Exportar</button></div>`);
-    if (r.acao !== 'ok') return;
-    const wb = CC.montarPlanilha(XLSX, t, cursos(), {
-      lista: { titulo: r.dados.titulo.trim(), data: r.dados.data, extras: Math.max(0, Math.min(40, parseInt(r.dados.extras, 10) || 0)) }
-    });
+      <label class="field">Alunos na lista<select name="criterio">${Object.keys(crit).map(k => `<option value="${k}" ${k === sugerido ? 'selected' : ''}>${esc(crit[k])}</option>`).join('')}</select></label>
+      <div class="row nowrap" data-crit="faixa" hidden>
+        <label class="field grow">Média parcial de (≥)<input type="number" step="0.1" min="0" max="10" name="min" value="${c.mediaVS}"></label>
+        <label class="field grow">até menos de (&lt;)<input type="number" step="0.1" min="0" max="10.1" name="max" value="${c.mediaMin}"></label></div>
+      <div class="checks" data-crit="faixa" hidden><label><input type="checkbox" name="freq" checked> só quem tem frequência suficiente</label></div>
+      <div data-crit="manual" hidden>
+        <div class="row nowrap small"><button type="button" class="btn" data-marcar="1">Marcar todos</button><button type="button" class="btn" data-marcar="0">Desmarcar</button></div>
+        <div class="checks lista-manual">${todos.map(a => `<label><input type="checkbox" name="ids" value="${esc(a.id)}" ${a.ativo ? 'checked' : ''}> ${esc(a.nome)}${a.ativo ? '' : ' <span class="muted">(saiu)</span>'}</label>`).join('')}</div>
+      </div>
+      <p class="muted small" id="lista-conta"></p>`;
+  }
+
+  function lerLista(d) {
+    const num = v => { const x = parseFloat(String(v == null ? '' : v).replace(',', '.')); return isNaN(x) ? null : x; };
+    return {
+      titulo: String(d.titulo || '').trim(), data: d.data || '', extras: Math.max(0, Math.min(40, parseInt(d.extras, 10) || 0)),
+      criterio: { tipo: d.criterio || 'ativos', min: num(d.min), max: num(d.max), freq: !!d.freq, ids: [].concat(d.ids || []) }
+    };
+  }
+
+  /** Mostra os campos do critério escolhido e conta quem vai para a lista. */
+  function ligarLista(form, t) {
+    const sel = form.querySelector('[name=criterio]');
+    const atualizar = () => {
+      form.querySelectorAll('[data-crit]').forEach(el => { el.hidden = el.dataset.crit !== sel.value; });
+      const dados = {};
+      new FormData(form).forEach((v, k) => { dados[k] = k in dados ? [].concat(dados[k], v) : v; });
+      const ol = lerLista(dados);
+      const lista = CC.alunosParaLista(t, ol.criterio);
+      const risc = lista.filter(a => CC.reprovadoPorFalta(t, CC.statsAluno(t, a).faltas)).length;
+      const lim = CC.limiteFaltas(t);
+      form.querySelector('#lista-conta').textContent = `${lista.length} aluno(s) na lista` +
+        (risc ? ` · ${risc} com mais de ${CC.numBR(lim, lim % 1 ? 1 : 0)} faltas aparecerão riscados` : '') + '.';
+    };
+    form.addEventListener('change', atualizar);
+    form.addEventListener('input', atualizar);
+    form.querySelectorAll('[data-marcar]').forEach(b => b.addEventListener('click', () => {
+      form.querySelectorAll('.lista-manual input').forEach(i => { i.checked = b.dataset.marcar === '1'; });
+      atualizar();
+    }));
+    atualizar();
+  }
+
+  function semXLSX() {
+    if (window.XLSX) return false;
+    toast('Biblioteca de planilhas não carregou (abra o app uma vez com internet).');
+    return true;
+  }
+
+  function entregarPlanilha(t, lista) {
+    const wb = CC.montarPlanilha(XLSX, t, cursos(), { lista });
     const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
-    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'xlsx'), t);
+    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'planilha', 'xlsx'), t);
+  }
+
+  /** Exporta a planilha; a aba "Lista de presença" é opcional. */
+  async function exportar(t) {
+    if (semXLSX()) return;
+    const r = await dialogo(`<h2>Exportar planilha</h2>
+      <p class="muted small">Abas: Chamada, Notas, Estatísticas (com plano de avaliação), Cronograma, Alunos, Observações e Configuração.</p>
+      <div class="checks"><label><input type="checkbox" name="comLista" id="com-lista"> incluir a aba Lista de presença (para assinatura)</label></div>
+      <div class="stack" id="campos-lista" hidden>${camposLista(t, proximaAvaliacao(t))}</div>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Exportar</button></div>`,
+      form => {
+        const c = form.querySelector('#com-lista');
+        c.onchange = () => { form.querySelector('#campos-lista').hidden = !c.checked; };
+        ligarLista(form, t);
+      });
+    if (r.acao !== 'ok') return;
+    entregarPlanilha(t, r.dados.comLista ? lerLista(r.dados) : null);
+  }
+
+  /** Lista de presença para assinatura: PDF pronto para imprimir ou planilha (ajustável no Excel). */
+  async function listaPresenca(t, aula) {
+    aula = aula || proximaAvaliacao(t);
+    const r = await dialogo(`<h2>Lista de presença</h2>
+      <div class="stack">${camposLista(t, aula)}</div>
+      <p class="muted small"><b>PDF</b>: pronto para imprimir (A4). <b>Planilha</b>: a planilha completa com a aba da lista, para ajustar larguras e alturas no Excel.</p>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn" value="xlsx">Planilha</button><button class="btn primary" value="pdf">PDF</button></div>`,
+      form => ligarLista(form, t));
+    if (!r.acao) return;
+    const ol = lerLista(r.dados);
+    if (!CC.alunosParaLista(t, ol.criterio).length && !ol.extras) return toast('Nenhum aluno atende ao critério escolhido.');
+    if (r.acao === 'xlsx') { if (!semXLSX()) entregarPlanilha(t, ol); return; }
+    toast('Gerando PDF…');
+    let blob;
+    try { blob = await ListaPDF.gerar(CC.dadosListaPresenca(t, cursos(), ol)); }
+    catch (e) { return toast('Não consegui gerar o PDF: ' + e.message); }
+    const rotulo = ol.titulo || (ol.data ? CC.fmtDate(ol.data).slice(0, 5).replace('/', '-') : '');
+    entregarArquivo(blob, CC.nomeArquivo(t, 'lista de presença' + (rotulo ? ' ' + rotulo : ''), 'pdf'), t);
   }
 
   async function configTurma(t) {
@@ -646,6 +730,7 @@
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(t.codigo)}"></label>
       <label class="field grow">Turma<input type="text" name="turma" value="${esc(t.turma)}"></label>
       <label class="field grow">Período<input type="text" name="periodo" value="${esc(t.periodo)}"></label></div>
+      <label class="field">Nome curto (nos nomes dos arquivos)<input type="text" name="nomeCurto" maxlength="40" value="${esc(t.nomeCurto || '')}" placeholder="${esc(CC.nomeCurto(Object.assign({}, t, { nomeCurto: '' })))}"></label>
       <div class="row nowrap">
       <label class="field grow">Atraso vale (faltas)<input type="number" step="0.05" min="0" max="1" name="pesoAtraso" value="${c.pesoAtraso}"></label>
       <label class="field grow">Frequência mínima (%)<input type="number" min="0" max="100" name="freqMin" value="${c.freqMin}"></label>
@@ -657,6 +742,8 @@
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
     if (r.acao !== 'ok') return;
     ['disciplina', 'codigo', 'turma', 'periodo'].forEach(k => { t[k] = r.dados[k].trim(); });
+    const curto = String(r.dados.nomeCurto || '').trim();
+    if (curto) t.nomeCurto = curto; else delete t.nomeCurto;
     ['pesoAtraso', 'freqMin', 'mediaMin', 'mediaVS'].forEach(k => {
       const v = parseFloat(String(r.dados[k]).replace(',', '.'));
       if (!isNaN(v)) c[k] = v;
@@ -676,7 +763,7 @@
 
   function salvarBackup(t) {
     const dados = t ? { versao: 1, turmas: [t] } : db;
-    const nome = t ? CC.nomeArquivo(t, 'backup.json') : 'chamada-backup-' + CC.todayISO() + '.json';
+    const nome = CC.nomeArquivo(t || null, 'backup ' + CC.todayISO(), 'json');
     entregarArquivo(new Blob([JSON.stringify(dados)], { type: 'application/json' }), nome, t || null);
   }
 
@@ -985,10 +1072,38 @@
 
   /* ---------- pasta de trabalho ---------- */
 
+  function nomeNavegador() {
+    const ua = navigator.userAgent;
+    if (/DuckDuckGo/i.test(ua)) return 'DuckDuckGo';
+    if (/SamsungBrowser/i.test(ua)) return 'Samsung Internet';
+    if (/Firefox|FxiOS/i.test(ua)) return 'Firefox';
+    if (/EdgA?\//i.test(ua)) return 'Edge';
+    if (/OPR\//i.test(ua)) return 'Opera';
+    if (/; wv\)/.test(ua)) return 'um navegador baseado no WebView do Android';
+    if (/Chrome\//.test(ua)) return 'Chrome';
+    return 'este navegador';
+  }
+
+  /**
+   * O seletor de pasta/arquivo "cancelou". Se foi rápido demais para ter sido a pessoa, o
+   * navegador não sabe mostrar o seletor (ex.: DuckDuckGo e outros apps baseados no WebView).
+   */
+  function seletorFalhou(e, inicio, oque) {
+    const imediato = Date.now() - inicio < 1500;
+    if (e.name === 'AbortError' && !imediato) return;          // a pessoa cancelou
+    Pasta.marcarSemSeletor();
+    const android = /Android/i.test(navigator.userAgent);
+    dialogo(`<h2>O navegador não abriu ${esc(oque)}</h2>
+      <p>${esc(nomeNavegador())} recusou o pedido${e.name !== 'AbortError' ? ` (${esc(e.message || e.name)})` : ''}. As opções de pasta de trabalho e "Salvar como…" não serão mais oferecidas neste navegador.</p>
+      ${android ? `<p>No Android, use o app pelo <b>Chrome</b> (versão 132 ou mais nova): abra <b>${esc(location.origin + location.pathname)}</b> no Chrome e instale pelo menu ⋮ → <b>Instalar app</b>. Os dados ficam separados por navegador: faça um backup aqui (Menu → Salvar backup) e restaure lá.</p>` : '<p>Use o Chrome ou o Edge atualizados.</p>'}
+      <p class="muted small">Enquanto isso, ao exportar use <b>Compartilhar</b> (Drive, e-mail…) ou <b>Baixar</b>.</p>
+      <div class="acoes"><button class="btn primary" value="">Entendi</button></div>`);
+  }
+
   async function configurarPasta(t) {
     if (!Pasta.suportada) {
       return dialogo(`<h2>Pasta de trabalho</h2>
-        <p>Este navegador ainda não permite que o app escolha uma pasta.</p>
+        <p>${esc(nomeNavegador())} não permite que o app escolha uma pasta.${/Android/i.test(navigator.userAgent) ? ' No Android, o Chrome (versão 132 ou mais nova) permite: abra o app nele e instale pelo menu ⋮ → Instalar app.' : ''}</p>
         <p class="muted small">Ao exportar, use <b>Compartilhar</b> para mandar ao Google Drive (ou outro app) ou <b>Baixar</b> para a pasta Downloads; ao importar, o seletor de arquivos do sistema abre em qualquer pasta. No computador (Chrome ou Edge), a pasta de trabalho funciona.</p>
         <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
     }
@@ -1002,8 +1117,9 @@
       <button class="btn" value="">Fechar</button><button class="btn primary" value="escolher">${atual ? 'Trocar pasta…' : 'Escolher pasta…'}</button></div>`);
     if (r.acao === 'esquecer') { await Pasta.esquecer(k); return toast('Pasta esquecida'); }
     if (r.acao !== 'escolher') return;
+    const inicio = Date.now();
     try { const h = await Pasta.escolher(k); toast('Pasta de trabalho: ' + h.name); }
-    catch (e) { if (e.name !== 'AbortError') toast('Não consegui usar a pasta: ' + e.message); }
+    catch (e) { seletorFalhou(e, inicio, 'a lista de pastas'); }
   }
 
   /* ---------- arquivar turma ---------- */
@@ -1423,7 +1539,7 @@
       </div>
       <div class="acoes">${nova ? '' : '<button class="btn danger" value="remover" formnovalidate>Excluir</button><button class="btn" value="presenca" formnovalidate>Lista de presença</button>'}
       <button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
-    if (r.acao === 'presenca') return exportar(t, aula);
+    if (r.acao === 'presenca') return listaPresenca(t, aula);
     if (r.acao === 'remover') {
       const temChamada = CC.aulaRealizada(t, aula);
       const ok = !temChamada || await confirmar('Excluir aula', `A aula de ${CC.fmtDate(aula.data)} tem chamada registrada. Excluir mesmo assim?`, 'Excluir', true);
@@ -1581,7 +1697,7 @@
         : `<tr><td colspan="10" class="empty">Nenhum aluno neste filtro.</td></tr>`) +
       '</tbody></table></div>';
     app.innerHTML = h;
-    $('#exportar').onclick = () => exportar(t, null);
+    $('#exportar').onclick = () => exportar(t);
     ligarBarraVisao(t, stats);
     app.querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => go(`#/t/${t.id}/aluno/${tr.dataset.id}`));
   }

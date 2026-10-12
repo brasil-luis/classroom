@@ -3,7 +3,7 @@
 App web instalável (PWA) para fazer chamada pelo celular Android e organizar a turma.
 Funciona offline; os dados ficam só no aparelho.
 
-**Versão 0.3.1** — a numeração fica em 0.x até o app ter todas as funcionalidades
+**Versão 0.4.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
 planejadas; aí vira 1.0.
 
 ## O que faz
@@ -43,11 +43,18 @@ planejadas; aí vira 1.0.
   da carga horária (padrão 68 h em aulas de 2 h = 34 aulas); reprova quem passar de 25% de faltas.
 - **Curso e ingresso** a partir da matrícula (d1 = forma de ingresso, d2d3 = ano,
   d4d5d6 = código do curso). Tabela de cursos editável no app.
-- **Exporta .xlsx formatado** (Chamada, Lista de presença, Notas, Cronograma, Alunos,
-  Observações, Configuração), com fórmulas que continuam funcionando no Excel.
-- **Lista de presença para assinatura** (aba da planilha) em dia de prova; quem já passou
-  do limite de faltas aparece com o nome riscado.
+- **Exporta .xlsx formatado** (Chamada, Notas, Estatísticas, Cronograma, Alunos,
+  Observações, Configuração e, se quiser, Lista de presença), com fórmulas que continuam
+  funcionando no Excel.
+- **Lista de presença para assinatura** em dia de prova, em **PDF** (A4, pronta para imprimir;
+  [jsPDF](https://github.com/parallax/jsPDF)) ou como aba da planilha; quem já passou do
+  limite de faltas aparece com o nome riscado. Dá para escolher quem entra: inscritos, só quem
+  tem frequência, alunos para a VS (média parcial entre 4 e 6) ou para a VR (sem nota numa prova
+  já feita), também os que saíram, uma faixa de média ou escolhidos à mão.
 - Backup/restauração em JSON.
+- Nomes de arquivo legíveis: `LFTC 2026-2 - planilha.xlsx`, `LFTC 2026-2 - lista de presença P1.pdf`,
+  `LFTC 2026-2 - backup 2026-10-12.json` (o nome curto vem da sigla da disciplina + período e
+  pode ser trocado nas configurações da turma).
 
 ## Uso
 Abra <https://brasil-luis.github.io/classroom/> no Chrome do Android → menu ⋮ →

@@ -281,3 +281,4 @@ code { font-size: 12px; background: var(--surface-2); padding: 0 3px; border-rad
 .menu-list.arquivos button { display: flex; justify-content: space-between; gap: 8px; }
 .menu-list.arquivos .muted { flex: none; }
 .versao { text-align: center; margin: 28px 0 70px; }
+.lista-manual { max-height: 38vh; overflow-y: auto; display: flex; flex-direction: column; flex-wrap: nowrap; align-items: flex-start; gap: 2px; margin-top: 6px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 8px; }
