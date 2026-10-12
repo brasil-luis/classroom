@@ -617,6 +617,7 @@
     s.media = mediaAluno(t, aluno);
     s.mf = mediaFinal(t, aluno, s.media);
     s.situacao = situacao(t, s);
+    s.sitNota = situacaoNota(t, s);
     return s;
   }
 
@@ -726,6 +727,228 @@
     if (comVR) p.push({ nome: 'VR', tipo: 'VR', data: '', peso: 0, max: 10 });
     if (comVS) p.push({ nome: 'VS', tipo: 'VS', data: '', peso: 0, max: 10 });
     return p;
+  }
+
+  /* ---------- filtros e ordenação de alunos ---------- */
+
+  /** Situação só pela nota (sem o aviso "perto do limite"). */
+  function situacaoNota(t, s) {
+    return situacao(t, Object.assign({}, s, { limite: 0 }));
+  }
+
+  const FILTROS = {
+    todos: { rotulo: 'Todos', f: () => true },
+    aprovados: { rotulo: 'Aprovados (até agora)', f: x => x.st.sitNota.cod === 'OK' },
+    vs: { rotulo: 'Em VS', f: x => x.st.sitNota.cod === 'VS' },
+    reprovados: { rotulo: 'Reprovados (falta ou nota)', f: x => x.st.sitNota.cod === 'RF' || x.st.sitNota.cod === 'BAIXA' },
+    rf: { rotulo: 'Reprovados por falta', f: x => x.st.sitNota.cod === 'RF' },
+    nota: { rotulo: 'Abaixo da média / reprovados na VS', f: x => x.st.sitNota.cod === 'BAIXA' },
+    limite: { rotulo: 'Perto do limite de faltas', f: x => x.st.situacao.cod === 'LIM' },
+    semnota: { rotulo: 'Sem notas lançadas', f: x => x.st.media == null }
+  };
+
+  const ORDENS = {
+    nome: { rotulo: 'Nome (A–Z)', cmp: (x, y) => norm(x.a.nome).localeCompare(norm(y.a.nome)) },
+    matricula: { rotulo: 'Matrícula', cmp: (x, y) => (x.a.matricula || '').localeCompare(y.a.matricula || '') },
+    faltas: { rotulo: 'Faltas (mais → menos)', cmp: (x, y) => y.st.faltas - x.st.faltas },
+    media: { rotulo: 'Média (maior → menor)', cmp: (x, y) => (y.st.media == null ? -1 : y.st.media) - (x.st.media == null ? -1 : x.st.media) },
+    mf: { rotulo: 'Média final (maior → menor)', cmp: (x, y) => (y.st.mf == null ? -1 : y.st.mf) - (x.st.mf == null ? -1 : x.st.mf) },
+    curso: { rotulo: 'Curso', cmp: (x, y) => (x.curso || '').localeCompare(y.curso || '') }
+  };
+
+  /**
+   * Alunos com estatísticas, filtrados e ordenados.
+   * visao = { filtro, ordem, curso, inativos }; cursoDe(a) devolve o nome do curso.
+   */
+  function alunosVisao(t, visao, cursoDe) {
+    const v = Object.assign({ filtro: 'todos', ordem: 'nome', curso: '', inativos: false }, visao);
+    const lista = alunosOrdenados(t, v.inativos).map(a => ({ a, st: statsAluno(t, a), curso: cursoDe ? cursoDe(a) : '' }));
+    const f = (FILTROS[v.filtro] || FILTROS.todos).f;
+    const cmp = (ORDENS[v.ordem] || ORDENS.nome).cmp;
+    return lista
+      .filter(x => f(x) && (!v.curso || x.curso === v.curso))
+      .sort((x, y) => cmp(x, y) || ORDENS.nome.cmp(x, y));
+  }
+
+  /* ---------- estatísticas de notas ---------- */
+
+  function resumoNumeros(vals) {
+    const v = vals.filter(x => typeof x === 'number').sort((a, b) => a - b);
+    const n = v.length;
+    if (!n) return { n: 0 };
+    const media = v.reduce((s, x) => s + x, 0) / n;
+    const mediana = n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2;
+    const dp = n > 1 ? Math.sqrt(v.reduce((s, x) => s + (x - media) ** 2, 0) / (n - 1)) : 0;
+    return { n, media, mediana, dp, min: v[0], max: v[n - 1] };
+  }
+
+  /** Histograma na escala 0–10, em faixas de 1 ponto (a última inclui o 10). */
+  function histograma(valores10) {
+    const h = new Array(10).fill(0);
+    valores10.forEach(x => { if (typeof x === 'number') h[Math.min(9, Math.max(0, Math.floor(x)))]++; });
+    return h;
+  }
+
+  /**
+   * Estatísticas por avaliação e das médias (MP/MF), sobre os alunos inscritos.
+   * Cada item: { nome, max, n, total, media, mediana, dp, min, max, acima (% ≥ média mínima), hist }.
+   */
+  function estatisticasNotas(t) {
+    const alunos = alunosOrdenados(t, false);
+    const min10 = t.config.mediaMin;
+    const item = (nome, maxNota, vals) => {
+      const r = resumoNumeros(vals);
+      const em10 = vals.filter(x => typeof x === 'number').map(x => x / maxNota * 10);
+      return Object.assign({ nome, escala: maxNota, total: alunos.length, hist: histograma(em10),
+        acima: em10.length ? em10.filter(x => x >= min10 - 1e-9).length / em10.length : null }, r);
+    };
+    const res = t.avaliacoes.map(v => item(v.nome, v.max, alunos.map(a => (t.notas[v.id] || {})[a.id])));
+    const stats = alunos.map(a => statsAluno(t, a));
+    if (avaliacoesMedia(t).length) {
+      res.push(Object.assign(item(avaliacaoTipo(t, 'VS') ? 'MP' : 'Média', 10, stats.map(s => s.media)), { media_: true }));
+      if (avaliacaoTipo(t, 'VS')) res.push(Object.assign(item('MF', 10, stats.map(s => s.mf)), { media_: true }));
+    }
+    const sit = { aprovados: 0, vs: 0, nota: 0, rf: 0, semnota: 0 };
+    stats.forEach(s => {
+      const c = situacaoNota(t, s).cod;
+      if (c === 'RF') sit.rf++;
+      else if (s.media == null) sit.semnota++;
+      else if (c === 'OK') sit.aprovados++;
+      else if (c === 'VS') sit.vs++;
+      else sit.nota++;
+    });
+    return { avaliacoes: res, situacao: sit, total: alunos.length };
+  }
+
+  /* ---------- e-mail: modelos com campos do aluno ---------- */
+
+  const CAMPOS_EMAIL = {
+    nome: 'nome completo', primeiro_nome: 'primeiro nome', matricula: 'matrícula',
+    faltas: 'faltas até agora', maximo_faltas: 'máximo de faltas', aulas: 'aulas no período',
+    frequencia: 'frequência (%)', media: 'média parcial', mf: 'média final', notas: 'notas, uma por linha',
+    situacao: 'situação', disciplina: 'disciplina', codigo: 'código', turma: 'turma', periodo: 'período'
+  };
+
+  /** Troca {campo} pelos dados da turma e (se houver) do aluno. */
+  function preencherModelo(texto, t, aluno) {
+    const lim = limiteFaltas(t);
+    const fmt = x => x == null ? '—' : numBR(x, x % 1 ? 1 : 0);
+    const dados = { disciplina: t.disciplina, codigo: t.codigo, turma: t.turma, periodo: t.periodo, aulas: aulasPrevistas(t), maximo_faltas: fmt(lim) };
+    if (aluno) {
+      const s = statsAluno(t, aluno);
+      Object.assign(dados, {
+        nome: titleCase(aluno.nome), primeiro_nome: titleCase(aluno.nome.split(' ')[0]), matricula: aluno.matricula,
+        faltas: fmt(s.faltas), frequencia: s.freq == null ? '—' : Math.round(s.freq * 100) + '%',
+        media: fmt(s.media), mf: fmt(s.mf), situacao: situacaoNota(t, s).texto || 'sem notas ainda',
+        // VR e VS só aparecem para quem fez.
+        notas: t.avaliacoes.filter(v => !v.tipo || v.tipo === 'normal' || typeof (t.notas[v.id] || {})[aluno.id] === 'number').map(v => {
+          const n = (t.notas[v.id] || {})[aluno.id];
+          return v.nome + ': ' + (typeof n === 'number' ? fmt(n) + (v.max !== 10 ? ' / ' + v.max : '') : '—');
+        }).join('\n') || '(sem avaliações)'
+      });
+    }
+    return String(texto).replace(/\{(\w+)\}/g, (m, k) => dados[k] != null ? String(dados[k]) : m);
+  }
+
+  const MODELOS_EMAIL = [
+    { id: 'aviso', nome: 'Aviso geral', tipo: 'aviso', assunto: '[{codigo}] Aviso', corpo: 'Prezados(as),\n\n\n\n' },
+    { id: 'sala', nome: 'Mudança de sala', tipo: 'aviso', assunto: '[{codigo}] Mudança de sala',
+      corpo: 'Prezados(as),\n\nA aula de {disciplina} do dia __/__ será na sala ___.\n\n' },
+    { id: 'sem-aula', nome: 'Não haverá aula', tipo: 'aviso', assunto: '[{codigo}] Não haverá aula',
+      corpo: 'Prezados(as),\n\nNão haverá aula de {disciplina} no dia __/__.\n\n' },
+    { id: 'faltas', nome: 'Aviso de faltas (personalizado)', tipo: 'pessoal', assunto: '[{codigo}] Sua frequência em {disciplina}',
+      corpo: 'Olá, {primeiro_nome}.\n\nAté hoje você tem {faltas} falta(s) em {disciplina} ({codigo} {turma}). O máximo permitido é {maximo_faltas} faltas (25% das {aulas} aulas); acima disso a reprovação é por frequência.\n\n' },
+    { id: 'resumo', nome: 'Notas e faltas (personalizado)', tipo: 'pessoal', assunto: '[{codigo}] Sua situação em {disciplina}',
+      corpo: 'Olá, {primeiro_nome}.\n\nSua situação em {disciplina} ({codigo} {turma}) até agora:\n\n{notas}\nMédia: {media}\nFaltas: {faltas} (máximo {maximo_faltas})\nSituação: {situacao}\n\n' }
+  ];
+
+  /* ---------- casamento de texto lido por OCR com os alunos da turma ---------- */
+
+  function levenshtein(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+    for (let i = 1; i <= a.length; i++) {
+      const cur = [i];
+      for (let j = 1; j <= b.length; j++) {
+        cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      }
+      prev = cur;
+    }
+    return prev[b.length];
+  }
+
+  function similaridade(a, b) {
+    return a && b ? 1 - levenshtein(a, b) / Math.max(a.length, b.length) : 0;
+  }
+
+  const PARTICULAS = new Set(['DA', 'DE', 'DO', 'DAS', 'DOS', 'E', 'DI', 'DU']);
+
+  function tokensNome(s) {
+    return norm(s).replace(/[^A-Z ]/g, ' ').split(' ').filter(w => w.length >= 2 && !PARTICULAS.has(w));
+  }
+
+  /** Sequências que podem ser matrícula num texto de OCR (troca letras parecidas com dígitos). */
+  function digitosOCR(texto) {
+    const trocas = { O: '0', Q: '0', D: '0', U: '0', I: '1', L: '1', T: '1', J: '1', Z: '2', S: '5', B: '8', G: '6', A: '4' };
+    const toks = norm(texto).replace(/[^A-Z0-9 ]/g, ' ').split(' ').filter(Boolean);
+    const conv = toks.map(tok => {
+      const nd = (tok.match(/\d/g) || []).length;
+      if (nd < Math.max(2, tok.length * 0.6)) return '';
+      return tok.split('').map(c => /\d/.test(c) ? c : (trocas[c] || '')).join('');
+    });
+    const out = [];
+    conv.forEach((d, i) => {
+      if (d.length >= 7 && d.length <= 11) out.push(d);
+      // matrícula escrita em dois pedaços ("2230 31086")
+      if (d && conv[i + 1] && d.length + conv[i + 1].length >= 8 && d.length + conv[i + 1].length <= 10) out.push(d + conv[i + 1]);
+    });
+    return out;
+  }
+
+  /**
+   * Candidatos (alunos) para uma linha de texto lida por OCR, do mais provável ao menos.
+   * score 0–1: matrícula exata = 1; nome com tokens parecidos (tolera abreviação e erros).
+   */
+  function casarTexto(texto, alunos) {
+    const digs = digitosOCR(texto);
+    const lt = tokensNome(texto.replace(/\d+/g, ' '));
+    const res = [];
+    alunos.forEach(a => {
+      let sDig = 0;
+      if (a.matricula) {
+        digs.forEach(d => {
+          const dist = levenshtein(d, a.matricula);
+          sDig = Math.max(sDig, dist === 0 ? 1 : dist === 1 ? 0.85 : dist === 2 && d.length === 9 ? 0.6 : 0);
+        });
+      }
+      let sNome = 0;
+      if (lt.length) {
+        const at = tokensNome(a.nome);
+        const usados = new Set();
+        let total = 0, casados = 0, primeiro = false;
+        lt.forEach(w => {
+          let melhor = 0, k = -1;
+          at.forEach((x, j) => {
+            if (usados.has(j)) return;
+            // Abreviação: "J." ou "Joao" ~ "JOAO"
+            const s = w.length <= 2 && x.startsWith(w[0]) ? 0.7 : similaridade(w, x);
+            if (s > melhor) { melhor = s; k = j; }
+          });
+          if (melhor >= 0.72) { total += melhor; casados++; usados.add(k); if (k === 0) primeiro = true; }
+        });
+        if (casados) {
+          sNome = total / Math.max(lt.length, 2);
+          if (!primeiro) sNome *= 0.75;
+          if (casados >= 3) sNome = Math.min(1, sNome + 0.1);
+        }
+      }
+      let score = Math.max(sDig, sNome);
+      if (sDig >= 0.6 && sNome >= 0.4) score = Math.min(1, score + 0.15);
+      if (score > 0.3) res.push({ aluno: a, score, via: sDig >= sNome ? 'matrícula' : 'nome' });
+    });
+    return res.sort((x, y) => y.score - x.score).slice(0, 3);
   }
 
   /* ---------- matrícula UFF (9 dígitos) ----------
@@ -1047,6 +1270,40 @@
     nt['!rows'] = [{ hpt: 24 }];
     U.book_append_sheet(wb, nt, 'Notas');
 
+    // ---- Estatísticas das notas (fórmulas sobre a aba Notas)
+    if (avs.length && alunos.length) {
+      const es = {};
+      put(es, 0, 0, s(titulo, ST.titulo()));
+      put(es, 1, 0, s('Calculado a partir da aba Notas · "≥ média" = notas iguais ou acima de ' + numBR(minM) + ' na escala de 0 a 10', ST.subtitulo()));
+      ['', 'Notas lançadas', 'Média', 'Mediana', 'Desvio padrão', 'Mínima', 'Máxima', '≥ média'].forEach((h, c) => put(es, 3, c, s(h, c ? ST.cab() : ST.cabEsq())));
+      const r0 = NH + 2, r1 = NH + 1 + alunos.length;   // linhas (base 1) dos alunos na aba Notas
+      const colunas = avs.map(v => ({ nome: v.nome, col: colDe[v.id], max: v.max, vals: alunos.map(a => (t.notas[v.id] || {})[a.id]) }))
+        .concat(usaveis.length ? [{ nome: vs ? 'MP' : 'Média', col: U.encode_col(cMP), max: 10, vals: alunos.map(a => statsDe[a.id].media) }] : [])
+        .concat(vs && usaveis.length ? [{ nome: 'MF', col: U.encode_col(cMF), max: 10, vals: alunos.map(a => statsDe[a.id].mf) }] : []);
+      colunas.forEach((x, i) => {
+        const r = 4 + i, rng = 'Notas!' + x.col + r0 + ':' + x.col + r1;
+        const vazio = 'COUNT(' + rng + ')=0';
+        const st = corpo(i, false, { alignment: { horizontal: 'center' }, numFmt: '0.0' });
+        put(es, r, 0, s(x.nome + (x.max !== 10 ? ' (0–' + x.max + ')' : ''), corpo(i, false, { font: { bold: true } })));
+        // Valores já calculados (o Excel mostra estes até recalcular).
+        const rn = resumoNumeros(x.vals);
+        const nums = x.vals.filter(v => typeof v === 'number');
+        const cache = { AVERAGE: rn.media, MEDIAN: rn.mediana, STDEV: rn.n > 1 ? rn.dp : null, MIN: rn.min, MAX: rn.max };
+        const val = (v, extra) => v == null ? { t: 's', v: '' } : Object.assign({ t: 'n', v }, extra);
+        put(es, r, 1, { t: 'n', v: rn.n, f: 'COUNT(' + rng + ')', s: corpo(i, false, centro) });
+        [['AVERAGE', 2], ['MEDIAN', 3], ['STDEV', 4], ['MIN', 5], ['MAX', 6]].forEach(([fn, c]) => {
+          put(es, r, c, Object.assign(val(cache[fn], { z: '0.0' }), { s: st, f: 'IF(' + (fn === 'STDEV' ? 'COUNT(' + rng + ')<2' : vazio) + ',"",' + fn + '(' + rng + '))' }));
+        });
+        const acima = nums.length ? nums.filter(v => v >= minM / 10 * x.max - 1e-9).length / nums.length : null;
+        put(es, r, 7, { t: acima == null ? 's' : 'n', v: acima == null ? '' : acima, z: '0%', s: corpo(i, false, { alignment: { horizontal: 'center' }, numFmt: '0%' }),
+          f: 'IF(' + vazio + ',"",COUNTIF(' + rng + ',">="&' + (minM / 10 * x.max) + ')/COUNT(' + rng + '))' });
+      });
+      es['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: 3 + colunas.length, c: 7 } });
+      es['!cols'] = [{ wch: 16 }, { wch: 14 }, { wch: 9 }, { wch: 9 }, { wch: 13 }, { wch: 9 }, { wch: 9 }, { wch: 9 }];
+      es['!rows'] = [{ hpt: 24 }];
+      U.book_append_sheet(wb, es, 'Estatísticas');
+    }
+
     // ---- Cronograma
     const cr = {};
     put(cr, 0, 0, s(titulo, ST.titulo()));
@@ -1157,6 +1414,8 @@
     diffLista, aplicarLista, importarDados, gerarCronograma, aulaDaData, removerAula, removerAluno,
     aulaRealizada, contarAula, aulasPrevistas, limiteFaltas, reprovadoPorFalta, statsAluno, mediaAluno, mediaFinal, tipoFromConteudo,
     avaliacoesMedia, avaliacaoTipo, sincronizarAvaliacoes, aplicarPlano, planoPadrao,
+    levenshtein, casarTexto, digitosOCR,
+    FILTROS, ORDENS, alunosVisao, situacaoNota, estatisticasNotas, CAMPOS_EMAIL, MODELOS_EMAIL, preencherModelo,
     montarPlanilha, nomeArquivo, infoMatricula, cursosEncontrados, FORMAS_INGRESSO
   };
 })(typeof window !== 'undefined' ? window : globalThis);

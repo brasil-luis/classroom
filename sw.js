@@ -1,8 +1,8 @@
 /* Service worker: deixa o app funcionando sem internet. */
-const CACHE = 'chamada-0.1.0';
+const CACHE = 'chamada-0.3.0';
 const SHELL = [
   './', 'index.html', 'css/app.css', 'js/core.js', 'js/app.js', 'manifest.webmanifest',
-  'js/cursos-uff.js', 'icons/icon-192.png', 'icons/icon-512.png',
+  'js/cursos-uff.js', 'js/ocr.js', 'js/pasta.js', 'icons/icon-192.png', 'icons/icon-512.png',
   'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js'
 ];
 
@@ -17,17 +17,21 @@ self.addEventListener('activate', ev => {
 });
 
 // Arquivos do app: rede primeiro (pega atualizações), cache se offline.
-// Biblioteca da CDN: cache primeiro (versão fixa).
+// Bibliotecas da CDN (versões fixas): cache primeiro; o que for baixado depois (leitor de
+// texto e modelo de português, na 1ª leitura de folha) também fica guardado para uso offline.
 self.addEventListener('fetch', ev => {
   const req = ev.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== location.origin) {
-    ev.respondWith(caches.match(req).then(r => r || fetch(req)));
+    ev.respondWith(caches.match(req).then(r => r || fetch(req).then(res => {
+      if (res.ok && res.type === 'cors') { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
+      return res;
+    })));
     return;
   }
   ev.respondWith(
-    fetch(req).then(res => {
+    fetch(req, { cache: 'no-cache' }).then(res => {
       if (res.ok) { const copy = res.clone(); caches.open(CACHE).then(c => c.put(req, copy)); }
       return res;
     }).catch(() => caches.match(req, { ignoreSearch: true }).then(r => r || caches.match('index.html')))

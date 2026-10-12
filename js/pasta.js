@@ -1,0 +1,93 @@
+/* ClassroomControl — pasta de trabalho (File System Access API).
+ * Guarda a pasta escolhida (geral e, se quiser, uma por turma) no IndexedDB do navegador,
+ * para exportar e importar direto nela. Onde a API não existe (parte dos navegadores do
+ * Android), o app continua usando baixar/compartilhar. */
+(function (g) {
+  'use strict';
+  const suportada = typeof g.showDirectoryPicker === 'function';
+  const suportaSalvarComo = typeof g.showSaveFilePicker === 'function';
+
+  let banco = null;
+  function idb() {
+    if (!banco) {
+      banco = new Promise((ok, erro) => {
+        const req = indexedDB.open('classroomcontrol-pastas', 1);
+        req.onupgradeneeded = () => req.result.createObjectStore('h');
+        req.onsuccess = () => ok(req.result);
+        req.onerror = () => erro(req.error);
+      });
+    }
+    return banco;
+  }
+
+  async function operar(modo, fn) {
+    const db = await idb();
+    return new Promise((ok, erro) => {
+      const tx = db.transaction('h', modo);
+      const req = fn(tx.objectStore('h'));
+      tx.oncomplete = () => ok(req ? req.result : undefined);
+      tx.onerror = () => erro(tx.error);
+    });
+  }
+
+  const chave = t => t ? 't:' + t.id : 'global';
+  const obter = k => operar('readonly', s => s.get(k)).catch(() => null);
+  const guardar = (k, h) => operar('readwrite', s => s.put(h, k));
+  const esquecer = k => operar('readwrite', s => s.delete(k));
+
+  /** Pede (se preciso) permissão de leitura e escrita; precisa de um toque recente do usuário. */
+  async function permitir(h) {
+    const o = { mode: 'readwrite' };
+    if (await h.queryPermission(o) === 'granted') return true;
+    return (await h.requestPermission(o)) === 'granted';
+  }
+
+  async function escolher(k) {
+    const h = await g.showDirectoryPicker({ id: k === 'global' ? 'chamada-geral' : 'chamada-turma', mode: 'readwrite', startIn: 'documents' });
+    await guardar(k, h);
+    return h;
+  }
+
+  /** Pasta a usar para a turma (a dela ou a geral), já com permissão; ou null. */
+  async function da(t) {
+    if (!suportada) return null;
+    for (const k of [t ? chave(t) : null, 'global'].filter(Boolean)) {
+      const h = await obter(k);
+      if (!h) continue;
+      try { if (await permitir(h)) return { handle: h, chave: k }; } catch (e) { /* sem permissão */ }
+    }
+    return null;
+  }
+
+  async function existe(h, nome) {
+    try { await h.getFileHandle(nome); return true; } catch (e) { return false; }
+  }
+
+  async function gravar(h, nome, blob) {
+    const fh = await h.getFileHandle(nome, { create: true });
+    const w = await fh.createWritable();
+    await w.write(blob);
+    await w.close();
+  }
+
+  /** Arquivos da pasta com as extensões dadas, do mais recente ao mais antigo. */
+  async function listar(h, exts) {
+    const out = [];
+    for await (const e of h.values()) {
+      if (e.kind !== 'file' || !exts.some(x => e.name.toLowerCase().endsWith(x))) continue;
+      const f = await e.getFile();
+      out.push({ nome: e.name, data: f.lastModified, tamanho: f.size, handle: e });
+    }
+    return out.sort((a, b) => b.data - a.data);
+  }
+
+  async function salvarComo(nome, blob, inicio) {
+    const h = await g.showSaveFilePicker({ suggestedName: nome, startIn: inicio || 'documents' });
+    const w = await h.createWritable();
+    await w.write(blob);
+    await w.close();
+    return h.name;
+  }
+
+  g.Pasta = { suportada, suportaSalvarComo, chave, obter, escolher, esquecer, permitir, da, existe, gravar, listar, salvarComo };
+})(window);

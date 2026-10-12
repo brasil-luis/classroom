@@ -10,7 +10,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.1.0';
+  const VERSAO = '0.3.0';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -81,7 +81,16 @@
   }
 
   /** Abre o diálogo; resolve com o botão clicado (value) e os campos do formulário. */
-  function dialogo(html, aoAbrir) {
+  /** Fecha o diálogo aberto e espera o evento "close" (que é assíncrono), para ele não
+   *  ser confundido com o fechamento do próximo diálogo. */
+  function fecharDialogo() {
+    const dlg = $('#dlg');
+    if (!dlg.open) return Promise.resolve();
+    return new Promise(ok => { dlg.addEventListener('close', () => ok(), { once: true }); dlg.close(); });
+  }
+
+  async function dialogo(html, aoAbrir) {
+    await fecharDialogo();
     const dlg = $('#dlg'), form = $('#dlg-form');
     form.innerHTML = html;
     return new Promise(resolve => {
@@ -109,12 +118,36 @@
       .then(r => r.acao === 'ok');
   }
 
-  function escolherArquivo(accept) {
+  /**
+   * Escolhe um arquivo para importar. Com pasta de trabalho, mostra antes os arquivos dela
+   * (do mais recente ao mais antigo); "Outro arquivo…" abre o seletor do sistema.
+   */
+  async function escolherArquivo(accept, varios, t) {
+    const exts = accept.split(',').map(x => x.trim().toLowerCase()).filter(x => x.startsWith('.'));
+    if (!varios && exts.length && Pasta.suportada) {
+      const pasta = await Pasta.da(t);
+      if (pasta) {
+        let arqs = [];
+        try { arqs = await Pasta.listar(pasta.handle, exts); } catch (e) { /* pasta indisponível */ }
+        const r = await dialogo(`<h2>Abrir de “${esc(pasta.handle.name)}”</h2>
+          ${arqs.length ? `<ul class="menu-list arquivos">${arqs.slice(0, 40).map((a, i) => `<li><button value="${i}">${esc(a.nome)}<span class="muted small">${new Date(a.data).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}</span></button></li>`).join('')}</ul>`
+            : `<p class="muted">Nenhum arquivo ${exts.join(' / ')} nesta pasta.</p>`}
+          <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn" value="outro">Outro arquivo…</button></div>`);
+        if (r.acao === '') return null;
+        if (r.acao !== 'outro') return arqs[+r.acao].handle.getFile();
+      }
+    }
+    return escolherDoSistema(accept, varios);
+  }
+
+  /** Abre o seletor de arquivos do sistema; com `varios`, devolve uma lista. */
+  function escolherDoSistema(accept, varios) {
     const input = $('#file-input');
     input.value = '';
     input.accept = accept;
+    input.multiple = !!varios;
     return new Promise(resolve => {
-      input.onchange = () => resolve(input.files[0] || null);
+      input.onchange = () => resolve(varios ? Array.from(input.files) : (input.files[0] || null));
       input.click();
     });
   }
@@ -127,18 +160,43 @@
     });
   }
 
-  async function entregarArquivo(blob, nome) {
+  /** Entrega um arquivo gerado: na pasta de trabalho, "salvar como", compartilhar ou baixar. */
+  async function entregarArquivo(blob, nome, t) {
     const file = new File([blob], nome, { type: blob.type });
-    if (navigator.canShare && navigator.canShare({ files: [file] })) {
-      const r = await dialogo(`<h2>Arquivo pronto</h2><p class="muted">${esc(nome)}</p>
-        <div class="acoes"><button class="btn" value="baixar">Baixar</button>
-        <button class="btn primary" value="compartilhar">Compartilhar…</button></div>`);
-      if (r.acao === 'compartilhar') {
-        try { await navigator.share({ files: [file], title: nome }); return; }
-        catch (e) { if (e.name === 'AbortError') return; }
-      }
-      if (r.acao !== 'baixar' && r.acao !== 'compartilhar') return;
+    const pasta = await Pasta.da(t);
+    const podeCompartilhar = !!(navigator.canShare && navigator.canShare({ files: [file] }));
+    const opcoes = [];
+    if (pasta) opcoes.push(['pasta', `Salvar em “${pasta.handle.name}”`]);
+    if (Pasta.suportaSalvarComo) opcoes.push(['salvarcomo', 'Salvar como… (escolher o local)']);
+    if (podeCompartilhar) opcoes.push(['compartilhar', 'Compartilhar… (Drive, e-mail…)']);
+    opcoes.push(['baixar', 'Baixar (pasta Downloads)']);
+    const r = await dialogo(`<h2>Arquivo pronto</h2><p class="muted">${esc(nome)}</p>
+      <div class="stack">${opcoes.map((o, i) => `<button class="btn block ${i ? '' : 'primary'}" value="${o[0]}">${esc(o[1])}</button>`).join('')}</div>
+      ${!pasta && Pasta.suportada ? '<p class="muted small" style="margin-top:12px">Dica: escolha uma pasta de trabalho (menu ⋮) para salvar direto nela.</p>' : ''}
+      <div class="acoes"><button class="btn" value="">Cancelar</button></div>`);
+    if (r.acao === 'pasta') {
+      try {
+        let destino = nome;
+        if (await Pasta.existe(pasta.handle, nome)) {
+          const comData = nome.replace(/(\.[a-z]+)$/i, '-' + CC.todayISO() + '$1');
+          const q = await dialogo(`<h2>Arquivo já existe</h2><p><b>${esc(nome)}</b> já está em “${esc(pasta.handle.name)}”. Se você ajustou essa planilha no Excel, substituir apaga os ajustes.</p>
+            <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn" value="data">Salvar como ${esc(comData)}</button><button class="btn danger" value="subst">Substituir</button></div>`);
+          if (!q.acao) return;
+          if (q.acao === 'data') destino = comData;
+        }
+        await Pasta.gravar(pasta.handle, destino, blob);
+        return toast(`Salvo em ${pasta.handle.name}/${destino}`);
+      } catch (e) { return toast('Não consegui gravar na pasta: ' + e.message); }
     }
+    if (r.acao === 'salvarcomo') {
+      try { const n = await Pasta.salvarComo(nome, blob, pasta && pasta.handle); return toast('Salvo: ' + n); }
+      catch (e) { if (e.name !== 'AbortError') toast('Não consegui salvar: ' + e.message); return; }
+    }
+    if (r.acao === 'compartilhar') {
+      try { await navigator.share({ files: [file], title: nome }); } catch (e) { /* cancelado */ }
+      return;
+    }
+    if (r.acao !== 'baixar') return;
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = nome;
@@ -187,7 +245,7 @@
     const arg = partes[3];
     setTabs(t, tela === 'aluno' ? 'alunos' : tela);
     setTopo(t.codigo ? (t.codigo + (t.turma ? ' ' + t.turma : '')) : t.disciplina,
-      t.codigo ? t.disciplina : t.periodo, '#/', () => menuTurma(t));
+      (t.codigo ? t.disciplina : t.periodo) + (t.arquivada ? ' · arquivada' : ''), '#/', () => menuTurma(t));
     ({ chamada: telaChamada, alunos: telaAlunos, aluno: telaAluno, cronograma: telaCronograma, notas: telaNotas, resumo: telaResumo }[tela] || telaChamada)(t, arg);
   }
 
@@ -204,14 +262,18 @@
         <button class="btn block" id="nova">Criar turma vazia</button>
         <button class="btn block" id="restaurar">Restaurar backup</button></div></div>`;
     } else {
-      app.innerHTML = db.turmas.map(t => {
+      const cartao = t => {
         const ativos = t.alunos.filter(a => a.ativo).length;
         const dadas = t.aulas.filter(a => CC.aulaRealizada(t, a)).length;
-        return `<a class="card turma-card" href="#/t/${t.id}/chamada">
+        return `<a class="card turma-card ${t.arquivada ? 'arquivada' : ''}" href="#/t/${t.id}/chamada">
           <div><span class="codigo">${esc([t.codigo, t.turma].filter(Boolean).join(' '))}</span> <span class="muted">${esc(t.periodo)}</span></div>
           <h2>${esc(t.disciplina)}</h2>
-          <div class="muted small">${ativos} alunos · ${dadas} de ${CC.aulasPrevistas(t)} aulas com chamada</div></a>`;
-      }).join('') + `<button class="fab" id="imp">+ Importar planilha</button>`;
+          <div class="muted small">${ativos} alunos · ${dadas} de ${CC.aulasPrevistas(t)} aulas com chamada${t.arquivada ? ' · arquivada em ' + CC.fmtDate(t.arquivada) : ''}</div></a>`;
+      };
+      const ativas = db.turmas.filter(t => !t.arquivada), arquivadas = db.turmas.filter(t => t.arquivada);
+      app.innerHTML = (ativas.length ? ativas.map(cartao).join('') : '<div class="card empty">Nenhuma turma ativa.</div>') +
+        (arquivadas.length ? `<details class="arquivo"><summary>Turmas arquivadas (${arquivadas.length})</summary>${arquivadas.map(cartao).join('')}</details>` : '') +
+        `<button class="fab" id="imp">+ Importar planilha</button>`;
     }
     const imp = $('#imp'); if (imp) imp.onclick = importarNovaTurma;
     const nova = $('#nova'); if (nova) nova.onclick = criarTurmaVazia;
@@ -223,6 +285,7 @@
       <li><button value="importar">Importar planilha (nova turma)</button></li>
       <li><button value="vazia">Criar turma vazia</button></li>
       <li class="sep"></li>
+      <li><button value="pasta">Pasta de trabalho</button></li>
       <li><button value="cursos">Códigos de curso</button></li>
       <li><button value="backup">Salvar backup (todas as turmas)</button></li>
       <li><button value="restaurar">Restaurar backup</button></li>
@@ -230,6 +293,7 @@
       <li><button value="sobre">Sobre</button></li>
       </ul>`).then(r => {
       if (r.acao === 'cursos') editarCursos();
+      if (r.acao === 'pasta') configurarPasta(null);
       if (r.acao === 'importar') importarNovaTurma();
       if (r.acao === 'vazia') criarTurmaVazia();
       if (r.acao === 'backup') salvarBackup();
@@ -473,17 +537,23 @@
     dialogo(`<h2>${esc(CC.nomeTurma(t))}</h2><ul class="menu-list">
       <li><button value="exportar">Exportar planilha (.xlsx)</button></li>
       <li><button value="presenca">Lista de presença para assinatura (na planilha)</button></li>
+      <li><button value="email">Enviar e-mail aos alunos</button></li>
       <li><button value="lista">Atualizar lista de alunos (planilha nova do sistema)</button></li>
       <li><button value="importar">Importar chamada / notas / cronograma de planilha</button></li>
       <li class="sep"></li>
       <li><button value="plano">Plano de avaliação</button></li>
       <li><button value="config">Configurações da turma</button></li>
+      <li><button value="pasta">Pasta de trabalho desta turma</button></li>
       <li><button value="backup">Salvar backup desta turma</button></li>
+      <li><button value="arquivar">${t.arquivada ? 'Desarquivar turma' : 'Arquivar turma (fim do período)'}</button></li>
       <li class="sep"></li>
       <li><button value="excluir" class="danger" style="color:var(--danger)">Excluir turma</button></li>
       </ul>`).then(r => {
       if (r.acao === 'exportar') exportar(t, null);
       if (r.acao === 'presenca') exportar(t, null);
+      if (r.acao === 'email') enviarEmail(t, null);
+      if (r.acao === 'arquivar') alternarArquivo(t);
+      if (r.acao === 'pasta') configurarPasta(t);
       if (r.acao === 'lista') atualizarLista(t);
       if (r.acao === 'importar') importarArquivoNaTurma(t);
       if (r.acao === 'config') configTurma(t);
@@ -494,7 +564,7 @@
   }
 
   async function atualizarLista(t) {
-    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv');
+    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv', false, t);
     if (!file) return;
     let p;
     try { p = await lerPlanilha(file); } catch (e) { return toast('Erro ao ler: ' + e.message); }
@@ -519,7 +589,7 @@
   }
 
   async function importarArquivoNaTurma(t) {
-    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv');
+    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv', false, t);
     if (!file) return;
     let p;
     try { p = await lerPlanilha(file); } catch (e) { return toast('Erro ao ler: ' + e.message); }
@@ -565,7 +635,7 @@
       lista: { titulo: r.dados.titulo.trim(), data: r.dados.data, extras: Math.max(0, Math.min(40, parseInt(r.dados.extras, 10) || 0)) }
     });
     const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
-    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'xlsx'));
+    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'xlsx'), t);
   }
 
   async function configTurma(t) {
@@ -606,7 +676,7 @@
   function salvarBackup(t) {
     const dados = t ? { versao: 1, turmas: [t] } : db;
     const nome = t ? CC.nomeArquivo(t, 'backup.json') : 'chamada-backup-' + CC.todayISO() + '.json';
-    entregarArquivo(new Blob([JSON.stringify(dados)], { type: 'application/json' }), nome);
+    entregarArquivo(new Blob([JSON.stringify(dados)], { type: 'application/json' }), nome, t || null);
   }
 
   async function restaurarBackup() {
@@ -663,6 +733,302 @@
     toast(Object.keys(nova).length + ' cursos salvos');
   }
 
+  /* ---------- leitura de folha de presença por foto (OCR no aparelho) ---------- */
+
+  const ETAPAS_OCR = {
+    'loading tesseract core': 'Carregando o leitor de texto…',
+    'initializing tesseract': 'Preparando o leitor…',
+    'loading language traineddata': 'Carregando o português (só na 1ª vez demora)…',
+    'initializing api': 'Preparando o leitor…',
+    'recognizing text': 'Lendo a folha…'
+  };
+
+  function progressoOCR(texto, frac) {
+    const el = document.querySelector('#ocr-progresso');
+    if (!el) return;
+    el.querySelector('.txt').textContent = texto;
+    el.querySelector('progress').value = frac || 0;
+  }
+
+  async function lerFolhaPresenca(t, aula) {
+    const fotos = await escolherDoSistema('image/*', true);
+    if (!fotos || !fotos.length) return;
+    const dlg = $('#dlg'), form = $('#dlg-form');
+    form.innerHTML = `<h2>Lendo ${fotos.length > 1 ? fotos.length + ' fotos' : 'a foto'}</h2>
+      <div id="ocr-progresso"><p class="txt muted">Começando…</p><progress max="1" value="0" style="width:100%"></progress></div>
+      <p class="muted small">Tudo é feito no aparelho; a foto não sai do celular.</p>`;
+    dlg.returnValue = '';
+    dlg.showModal();
+    const alunos = CC.alunosOrdenados(t, false);
+    let linhas = [], tipo = 'mao';
+    try {
+      for (let k = 0; k < fotos.length; k++) {
+        const r = await OCR.lerFolha(fotos[k], alunos, (st, p) => {
+          progressoOCR((fotos.length > 1 ? `Foto ${k + 1} de ${fotos.length}: ` : '') + (ETAPAS_OCR[st] || 'Processando…'), st === 'recognizing text' ? p : 0);
+        }, cursoDe);
+        if (r.tipo === 'impressa') tipo = 'impressa';
+        linhas = linhas.concat(r.linhas);
+      }
+    } catch (e) {
+      await fecharDialogo();
+      return toast('Não consegui ler a foto: ' + e.message);
+    }
+    await fecharDialogo();
+    // Entre fotos diferentes, um aluno também só vale uma vez (fica a linha de maior score).
+    const melhor = new Map();
+    linhas.forEach((l, i) => {
+      if (!l.aluno) return;
+      const j = melhor.get(l.aluno.id);
+      if (j == null || l.candidatos[0].score > linhas[j].candidatos[0].score) melhor.set(l.aluno.id, i);
+    });
+    linhas.forEach((l, i) => { if (l.aluno && melhor.get(l.aluno.id) !== i) { l.aluno = null; l.presente = false; l.duplicada = true; } });
+    conferirLeitura(t, aula, linhas, tipo);
+  }
+
+  async function conferirLeitura(t, aula, linhas, tipo) {
+    const alunos = CC.alunosOrdenados(t, false);
+    const opcoes = sel => '<option value="">— ignorar esta linha —</option>' +
+      alunos.map(a => `<option value="${a.id}" ${sel && sel.id === a.id ? 'selected' : ''}>${esc(nomeCurto(a.nome))}</option>`).join('');
+    const reconhecidos = new Set(linhas.filter(l => l.aluno).map(l => l.aluno.id));
+    const fora = alunos.filter(a => !reconhecidos.has(a.id));
+    const nPres = linhas.filter(l => l.presente).length;
+    const r = await dialogo(`<h2>Conferir leitura · ${CC.fmtDate(aula.data, true)}</h2>
+      <p class="muted small">${tipo === 'impressa' ? 'Lista impressa: presente = linha com assinatura.' : 'Folha escrita à mão: cada linha foi comparada com os alunos da turma.'}
+      ${nPres} presença(s) sugerida(s). Confira as linhas, corrija o aluno quando preciso e desmarque o que estiver errado.</p>
+      <div class="ocr-lista">${linhas.map((l, i) => `
+        <div class="ocr-item ${l.presente ? 'on' : ''}">
+          <img src="${l.imagem}" alt="linha ${i + 1} da foto">
+          <div class="row nowrap">
+            <label class="ocr-check"><input type="checkbox" name="ocrP" value="${i}" ${l.presente ? 'checked' : ''}> presente</label>
+            <select name="ocrA">${opcoes(l.aluno)}</select>
+          </div>
+          <div class="muted small">lido: “${esc(l.texto.slice(0, 70))}”${l.aluno ? ` · ${Math.round(l.candidatos[0].score * 100)}% pela ${l.candidatos[0].via}` : l.duplicada ? ' · aluno já reconhecido em outra linha' : ''}${l.tinta != null ? ` · ${l.tinta > 0.06 ? 'com' : 'sem'} assinatura` : ''}</div>
+        </div>`).join('')}</div>
+      ${fora.length ? `<details ${tipo === 'impressa' ? 'open' : ''}><summary class="small"><b>${fora.length}</b> aluno(s) não encontrados na foto — marque quem estava presente</summary>
+        <div class="checks" style="margin-top:8px">${fora.map(a => `<label><input type="checkbox" name="ocrExtra" value="${a.id}"> ${esc(nomeCurto(a.nome))}</label>`).join('')}</div></details>` : ''}
+      <label class="checks" style="margin-top:12px"><label><input type="checkbox" name="demaisF" checked> marcar os demais como falta</label></label>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Aplicar na chamada</button></div>`,
+    form => {
+      // Escolher um aluno numa linha já marca "presente"; "ignorar" desmarca.
+      form.querySelectorAll('.ocr-item').forEach(div => {
+        const sel = div.querySelector('select'), chk = div.querySelector('input[type=checkbox]');
+        sel.addEventListener('change', () => { chk.checked = !!sel.value; div.classList.toggle('on', chk.checked); });
+        chk.addEventListener('change', () => div.classList.toggle('on', chk.checked));
+      });
+    });
+    if (r.acao !== 'ok') return;
+    const escolhidos = [].concat(r.dados.ocrA == null ? [] : r.dados.ocrA);
+    const marcadas = new Set([].concat(r.dados.ocrP || []).map(Number));
+    const presentes = new Set(escolhidos.filter((id, i) => id && marcadas.has(i)));
+    [].concat(r.dados.ocrExtra || []).forEach(id => presentes.add(id));
+    const m = t.presencas[aula.id] || (t.presencas[aula.id] = {});
+    let nP = 0, nF = 0;
+    presentes.forEach(id => { if (!m[id] || m[id] === 'F') { m[id] = 'P'; nP++; } });
+    if (r.dados.demaisF) t.alunos.filter(a => a.ativo && !m[a.id]).forEach(a => { m[a.id] = 'F'; nF++; });
+    salvar(); render();
+    toast(`${nP} presença(s) e ${nF} falta(s) registradas`);
+  }
+
+  /* ---------- filtros e ordenação (Resumo, Alunos, Notas) ---------- */
+
+  const visoes = {};
+  function visaoDe(t) { return visoes[t.id] || (visoes[t.id] = { filtro: 'todos', ordem: 'nome', curso: '' }); }
+
+  function barraVisao(t, total, lista) {
+    const v = visaoDe(t);
+    const cursosT = Array.from(new Set(CC.alunosOrdenados(t, false).map(cursoDe).filter(Boolean))).sort();
+    const sel = (id, obj, atual) => `<select id="${id}">${Object.keys(obj).map(k => `<option value="${k}" ${atual === k ? 'selected' : ''}>${obj[k].rotulo}</option>`).join('')}</select>`;
+    return `<div class="card barra-visao"><div class="row nowrap">
+      <label class="field grow">Mostrar${sel('v-filtro', CC.FILTROS, v.filtro)}</label>
+      <label class="field grow">Ordenar por${sel('v-ordem', CC.ORDENS, v.ordem)}</label></div>
+      ${cursosT.length > 1 ? `<label class="field" style="margin-top:6px">Curso<select id="v-curso"><option value="">Todos os cursos</option>${cursosT.map(c => `<option ${v.curso === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>` : ''}
+      <div class="row small muted" style="margin-top:8px"><span>${lista.length} de ${total} aluno(s)</span>
+      <button class="btn small right" id="v-email" type="button" ${lista.length ? '' : 'disabled'}>✉ E-mail para estes</button></div></div>`;
+  }
+
+  function ligarBarraVisao(t, lista) {
+    ['filtro', 'ordem', 'curso'].forEach(k => {
+      const el = $('#v-' + k);
+      if (el) el.onchange = () => { visaoDe(t)[k] = el.value; render(); };
+    });
+    const em = $('#v-email');
+    if (em) em.onclick = () => enviarEmail(t, lista.map(x => x.a));
+  }
+
+  /* ---------- estatísticas de notas ---------- */
+
+  function miniHist(h) {
+    const mx = Math.max.apply(null, h) || 1;
+    return `<span class="hist" title="Distribuição de 0 a 10">${h.map((c, k) => `<i style="height:${Math.max(4, Math.round(c / mx * 100))}%;${c ? '' : 'opacity:.25'}" title="${k} a ${k + 1}: ${c}"></i>`).join('')}</span>`;
+  }
+
+  function cartaoEstatisticas(t) {
+    const e = CC.estatisticasNotas(t);
+    if (!e.avaliacoes.some(x => x.n)) return '';
+    const f = (x, casas) => x == null ? '—' : CC.numBR(x, casas == null ? 1 : casas);
+    const s = e.situacao;
+    return `<div class="card"><h3>Estatísticas</h3>
+      <div class="muted small" style="margin-bottom:8px">${e.total} inscritos ·
+        <span class="tag OK">${s.aprovados} com média suficiente</span>
+        ${CC.avaliacaoTipo(t, 'VS') ? `<span class="tag VS">${s.vs} em VS</span>` : ''}
+        <span class="tag BAIXA">${s.nota} abaixo da média</span>
+        <span class="tag RF">${s.rf} reprovados por falta</span>
+        ${s.semnota ? `<span class="tag fora">${s.semnota} sem notas</span>` : ''}</div>
+      <div class="tabela-wrap" style="box-shadow:none"><table><thead><tr><th></th><th class="num">Notas</th><th class="num">Média</th><th class="num opc">Mediana</th><th class="num opc">Mín–máx</th><th class="num">≥ ${f(t.config.mediaMin)}</th><th>Distribuição</th></tr></thead><tbody>` +
+      e.avaliacoes.map(x => `<tr${x.media_ ? ' class="linha-media"' : ''}><td><b>${esc(x.nome)}</b>${x.escala !== 10 ? ` <span class="muted small">/ ${x.escala}</span>` : ''}</td>
+        <td class="num">${x.n}/${x.total}</td><td class="num">${f(x.media)}</td><td class="num opc">${f(x.mediana)}</td>
+        <td class="num opc">${x.n ? f(x.min) + '–' + f(x.max) : '—'}</td><td class="num">${x.acima == null ? '—' : Math.round(x.acima * 100) + '%'}</td>
+        <td>${x.n ? miniHist(x.hist) : ''}</td></tr>`).join('') +
+      `</tbody></table></div><p class="muted small" style="margin:6px 0 0">Desvio padrão: ${e.avaliacoes.filter(x => x.n > 1).map(x => esc(x.nome) + ' ' + f(x.dp)).join(' · ') || '—'}</p></div>`;
+  }
+
+  /* ---------- e-mail (pelo app de e-mail do aparelho) ---------- */
+
+  function copiar(texto, msg) {
+    (navigator.clipboard ? navigator.clipboard.writeText(texto) : Promise.reject())
+      .then(() => toast(msg || 'Copiado'), () => toast('Não consegui copiar'));
+  }
+
+  function mailto(para, bcc, assunto, corpo) {
+    const q = [];
+    if (bcc && bcc.length) q.push('bcc=' + encodeURIComponent(bcc.join(',')));
+    q.push('subject=' + encodeURIComponent(assunto));
+    q.push('body=' + encodeURIComponent(corpo));
+    return 'mailto:' + encodeURIComponent(para || '') + '?' + q.join('&');
+  }
+
+  /**
+   * Escreve e envia e-mail aos alunos. Aviso: mesma mensagem para todos, em cópia oculta.
+   * Personalizado: uma mensagem por aluno, com {campos} preenchidos; cada uma abre no app de e-mail.
+   */
+  async function enviarEmail(t, lista) {
+    const todos = CC.alunosOrdenados(t, false);
+    const risco = todos.filter(a => { const c = CC.statsAluno(t, a).situacao.cod; return c === 'RF' || c === 'LIM'; });
+    const grupos = [];
+    if (lista && lista.length && lista.length !== todos.length) grupos.push(['lista', lista.length === 1 ? CC.titleCase(lista[0].nome) : `Os ${lista.length} alunos da lista atual`, lista]);
+    grupos.push(['todos', `Todos os inscritos (${todos.length})`, todos]);
+    if (risco.length) grupos.push(['risco', `Perto do limite ou reprovados por falta (${risco.length})`, risco]);
+    const modelos = CC.MODELOS_EMAIL.concat(db.modelosEmail || []);
+    const inicial = lista && lista.length === 1 ? modelos.find(m => m.id === 'resumo') : modelos[0];
+    const campos = Object.keys(CC.CAMPOS_EMAIL).map(k => `<code>{${k}}</code> ${CC.CAMPOS_EMAIL[k]}`).join(' · ');
+    const r = await dialogo(`<h2>Enviar e-mail</h2><div class="stack">
+      <label class="field">Para<select name="grupo">${grupos.map(g => `<option value="${g[0]}">${esc(g[1])}</option>`).join('')}</select></label>
+      <label class="field">Modelo<select name="modelo">${modelos.map(m => `<option value="${m.id}" ${m === inicial ? 'selected' : ''}>${esc(m.nome)}</option>`).join('')}</select></label>
+      <div class="checks"><label><input type="radio" name="tipo" value="aviso"> mesma mensagem para todos (cópia oculta)</label>
+        <label><input type="radio" name="tipo" value="pessoal"> uma mensagem personalizada por aluno</label></div>
+      <label class="field">Assunto<input type="text" name="assunto"></label>
+      <label class="field">Mensagem<textarea name="corpo" rows="8"></textarea></label>
+      <label class="field">Assinatura<textarea name="assinatura" rows="2" placeholder="ex.: Prof. Fulano — IC/UFF">${esc(db.assinatura || '')}</textarea></label>
+      <details class="muted small"><summary>Campos que você pode usar na mensagem personalizada</summary><p>${campos}</p></details>
+      <div class="row nowrap"><label class="checks"><label><input type="checkbox" name="salvar"> salvar como modelo</label></label>
+        <input type="text" name="nomeModelo" placeholder="nome do modelo" class="grow"></div>
+      </div>
+      <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Continuar</button></div>`,
+    form => {
+      const preencher = () => {
+        const m = modelos.find(x => x.id === form.modelo.value);
+        form.assunto.value = m.assunto; form.corpo.value = m.corpo;
+        form.querySelector(`[name=tipo][value=${m.tipo}]`).checked = true;
+      };
+      form.modelo.addEventListener('change', preencher);
+      preencher();
+    });
+    if (r.acao !== 'ok') return;
+    const d = r.dados;
+    db.assinatura = String(d.assinatura || '').trim();
+    if (d.salvar) {
+      (db.modelosEmail = db.modelosEmail || []).push({ id: CC.uid('m'), nome: String(d.nomeModelo || '').trim() || String(d.assunto).trim() || 'Modelo', tipo: d.tipo, assunto: d.assunto, corpo: d.corpo });
+    }
+    salvar();
+    const alvo = grupos.find(g => g[0] === d.grupo)[2];
+    const comEmail = alvo.filter(a => a.email), semEmail = alvo.filter(a => !a.email);
+    const corpo = String(d.corpo).replace(/\s+$/, '') + (db.assinatura ? '\n\n' + db.assinatura : '');
+    const avisoSem = semEmail.length ? `<p class="small" style="color:var(--A)">Sem e-mail cadastrado: ${semEmail.map(a => esc(nomeCurto(a.nome))).join(', ')}</p>` : '';
+    if (!comEmail.length) return toast('Nenhum destinatário tem e-mail cadastrado');
+
+    if (d.tipo === 'aviso') {
+      const assunto = CC.preencherModelo(d.assunto, t, null), texto = CC.preencherModelo(corpo, t, null);
+      // Endereços longos demais quebram alguns apps de e-mail: divide em partes.
+      const partes = [];
+      let atual = [];
+      comEmail.forEach(a => {
+        if (atual.length && mailto('', atual.concat(a.email), assunto, texto).length > 1900) { partes.push(atual); atual = []; }
+        atual.push(a.email);
+      });
+      if (atual.length) partes.push(atual);
+      await dialogo(`<h2>Aviso para ${comEmail.length} aluno(s)</h2>
+        <p class="muted small">Os endereços vão em cópia oculta (um não vê o e-mail do outro).</p>
+        <div class="stack">${partes.map((p, k) => `<a class="btn primary block" href="${mailto('', p, assunto, texto)}">Abrir no e-mail${partes.length > 1 ? ` — parte ${k + 1} de ${partes.length} (${p.length})` : ''}</a>`).join('')}
+        <div class="row"><button class="btn small" type="button" id="cp-end">Copiar endereços</button><button class="btn small" type="button" id="cp-msg">Copiar mensagem</button></div></div>
+        ${avisoSem}
+        <div class="acoes"><button class="btn" value="">Fechar</button></div>`, form => {
+        form.querySelector('#cp-end').onclick = () => copiar(comEmail.map(a => a.email).join(', '), 'Endereços copiados');
+        form.querySelector('#cp-msg').onclick = () => copiar(assunto + '\n\n' + texto, 'Mensagem copiada');
+      });
+      return;
+    }
+
+    await dialogo(`<h2>Mensagens personalizadas</h2>
+      <p class="muted small">Toque em "Enviar" em cada aluno: a mensagem dele abre no app de e-mail, já preenchida. Volte aqui para o próximo.</p>
+      <div class="lista-chamada envio">${comEmail.map(a => {
+        const texto = CC.preencherModelo(corpo, t, a);
+        return `<div class="aluno-row"><div class="nome">${esc(nomeCurto(a.nome))}<div class="det">${esc(texto.split('\n').filter(Boolean)[1] || texto.split('\n')[0]).slice(0, 90)}</div></div>
+          <a class="btn small" href="${mailto(a.email, null, CC.preencherModelo(d.assunto, t, a), texto)}" data-env>Enviar</a></div>`;
+      }).join('')}</div>${avisoSem}
+      <div class="acoes"><button class="btn" value="">Fechar</button></div>`, form => {
+      form.querySelectorAll('[data-env]').forEach(a => a.addEventListener('click', () => {
+        a.textContent = '✓ Enviado'; a.closest('.aluno-row').classList.add('enviado');
+      }));
+    });
+  }
+
+  /* ---------- pasta de trabalho ---------- */
+
+  async function configurarPasta(t) {
+    if (!Pasta.suportada) {
+      return dialogo(`<h2>Pasta de trabalho</h2>
+        <p>Este navegador ainda não permite que o app escolha uma pasta.</p>
+        <p class="muted small">Ao exportar, use <b>Compartilhar</b> para mandar ao Google Drive (ou outro app) ou <b>Baixar</b> para a pasta Downloads; ao importar, o seletor de arquivos do sistema abre em qualquer pasta. No computador (Chrome ou Edge), a pasta de trabalho funciona.</p>
+        <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
+    }
+    const k = Pasta.chave(t);
+    const atual = await Pasta.obter(k), geral = t ? await Pasta.obter('global') : null;
+    const r = await dialogo(`<h2>Pasta de trabalho${t ? ' da turma' : ''}</h2>
+      <p>${atual ? `Atual: <b>${esc(atual.name)}</b>` : t ? `A turma usa a pasta geral${geral ? `: <b>${esc(geral.name)}</b>` : ' (nenhuma escolhida)'}.` : 'Nenhuma pasta escolhida.'}</p>
+      <p class="muted small">${t ? 'Exportações, backups e importações desta turma usam esta pasta; sem ela, vale a pasta geral.' : 'Exportações, backups e importações usam esta pasta (cada turma pode ter a sua, no menu da turma).'}
+      O navegador pode pedir permissão para editar arquivos nela.</p>
+      <div class="acoes">${atual ? '<button class="btn danger" value="esquecer">Esquecer</button>' : ''}
+      <button class="btn" value="">Fechar</button><button class="btn primary" value="escolher">${atual ? 'Trocar pasta…' : 'Escolher pasta…'}</button></div>`);
+    if (r.acao === 'esquecer') { await Pasta.esquecer(k); return toast('Pasta esquecida'); }
+    if (r.acao !== 'escolher') return;
+    try { const h = await Pasta.escolher(k); toast('Pasta de trabalho: ' + h.name); }
+    catch (e) { if (e.name !== 'AbortError') toast('Não consegui usar a pasta: ' + e.message); }
+  }
+
+  /* ---------- arquivar turma ---------- */
+
+  function alternarArquivo(t) {
+    t.arquivada = t.arquivada ? null : CC.todayISO();
+    salvar();
+    toast(t.arquivada ? 'Turma arquivada (continua em "Turmas arquivadas")' : 'Turma restaurada');
+    go('#/');
+  }
+
+  /* ---------- várias chamadas no mesmo dia ---------- */
+
+  function outraChamada(t, aula) {
+    const n = t.aulas.filter(a => a.data === aula.data).length;
+    const nova = CC.aulaDaData(t, aula.data, n, true);
+    salvar();
+    toast(`${n + 1}ª chamada de ${CC.fmtDate(aula.data)} — cada chamada conta como uma aula`);
+    go(`#/t/${t.id}/chamada/${nova.id}`);
+  }
+
+  function rotuloChamada(t, aula) {
+    const doDia = CC.aulasOrdenadas(t).filter(a => a.data === aula.data);
+    return doDia.length > 1 ? ` · ${doDia.indexOf(aula) + 1}ª chamada` : '';
+  }
+
   /* ---------- tela: chamada ---------- */
 
   let modoUmAUm = false;
@@ -706,7 +1072,7 @@
       <div class="aula-nav">
         <button class="icon-btn" id="ant" ${i <= 0 ? 'disabled' : ''} aria-label="Aula anterior" style="color:var(--text)">&#8249;</button>
         <div class="info" id="info-aula" style="cursor:pointer">
-          <div class="data">${CC.fmtDate(aula.data, true)}${aula.data === hoje ? ' · hoje' : ''}</div>
+          <div class="data">${CC.fmtDate(aula.data, true)}${aula.data === hoje ? ' · hoje' : ''}${rotuloChamada(t, aula)}</div>
           <div class="conteudo">${esc(aula.conteudo || 'Aula ' + (i + 1) + ' de ' + aulas.length)}</div>
         </div>
         <button class="icon-btn" id="prox" ${i >= aulas.length - 1 ? 'disabled' : ''} aria-label="Próxima aula" style="color:var(--text)">&#8250;</button>
@@ -717,6 +1083,8 @@
       <div class="row" style="margin-top:10px">
         <button class="btn small" id="modo">${modoUmAUm ? '☰ Lista' : '▶ Um a um'}</button>
         <button class="btn small" id="todos-p">Todos presentes</button><button class="btn small" id="todos-f">Todos ausentes</button>
+        <button class="btn small" id="ler-folha" title="Ler a folha de presença assinada pelos alunos">📷 Ler folha</button>
+        <button class="btn small" id="extra" title="Aula dupla, reposição ou segunda chamada no mesmo dia">+ Outra chamada neste dia</button>
         ${!temHoje ? `<button class="btn small right" id="hoje">+ Hoje</button>` : ''}
       </div></div>`;
 
@@ -749,8 +1117,10 @@
     $('#info-aula').onclick = () => editarAula(t, aula);
     $('#modo').onclick = () => { modoUmAUm = !modoUmAUm; idxUmAUm = primeiroVazio(alunos, marc); render(); };
     const hb = $('#hoje'); if (hb) hb.onclick = () => criarAulaHoje(t);
+    $('#extra').onclick = () => outraChamada(t, aula);
     $('#todos-p').onclick = () => marcarTodos(t, aula, 'P');
     $('#todos-f').onclick = () => marcarTodos(t, aula, 'F');
+    $('#ler-folha').onclick = () => lerFolhaPresenca(t, aula);
 
     if (modoUmAUm) {
       const a = alunos[idxUmAUm];
@@ -899,6 +1269,8 @@
   function telaAlunos(t) {
     const todos = CC.alunosOrdenados(t, true);
     const ativos = todos.filter(a => a.ativo).length;
+    const v = Object.assign({}, visaoDe(t), { inativos: true });
+    const lista = CC.alunosVisao(t, v, cursoDe);
     let h = `<div class="card"><div class="row"><div class="grow">
       <b>${ativos}</b> inscritos${todos.length > ativos ? ` · <span class="muted">${todos.length - ativos} fora da lista</span>` : ''}
       <div class="muted small">${t.listaEm ? 'Lista oficial atualizada em ' + CC.fmtDate(t.listaEm) : 'Lista oficial ainda não importada'}</div>
@@ -907,18 +1279,18 @@
     if (!todos.length) {
       h += `<div class="card empty">Sem alunos. Importe a lista do sistema ou adicione à mão.</div>`;
     } else {
-      h += `<div class="lista-chamada">` + todos.map(a => {
-        const st = CC.statsAluno(t, a);
-        return `<div class="aluno-row ${a.ativo ? '' : 'inativo'}" data-id="${a.id}">
+      h += barraVisao(t, todos.length, lista);
+      h += `<div class="lista-chamada">` + (lista.length ? lista.map(({ a, st }) => `<div class="aluno-row ${a.ativo ? '' : 'inativo'}" data-id="${a.id}">
           <div class="nome">${esc(nomeCurto(a.nome))}
           <div class="det">${esc(a.matricula || 'sem matrícula')}${cursoDe(a) ? ' · ' + esc(cursoDe(a)) : ''}${a.ativo ? '' : ' · fora da lista' + (a.saiuEm ? ' (' + esc(a.saiuEm.includes('-') ? CC.fmtDate(a.saiuEm) : a.saiuEm) + ')' : '')}${a.origem === 'manual' ? ' · incluído à mão' : ''}</div></div>
-          <div class="right small num">${CC.numBR(st.faltas)} F${st.situacao.cod === 'RF' ? ' <span class="tag RF">RF</span>' : ''}</div></div>`;
-      }).join('') + '</div>';
+          <div class="right small num">${CC.numBR(st.faltas)} F${st.media != null ? ' · ' + CC.numBR(st.mf != null ? st.mf : st.media) : ''}${st.sitNota.cod ? ` <span class="tag ${st.sitNota.cod}">${{ RF: 'RF', OK: 'OK', VS: 'VS', BAIXA: '↓' }[st.sitNota.cod]}</span>` : ''}</div></div>`).join('')
+        : '<div class="empty">Nenhum aluno neste filtro.</div>') + '</div>';
     }
     h += `<button class="fab" id="add">+ Aluno</button>`;
     app.innerHTML = h;
     $('#atualizar').onclick = () => atualizarLista(t);
     $('#add').onclick = () => editarAluno(t, null);
+    if (todos.length) ligarBarraVisao(t, lista.filter(x => x.a.ativo));
     app.querySelectorAll('.aluno-row').forEach(r => r.onclick = () => go(`#/t/${t.id}/aluno/${r.dataset.id}`));
   }
 
@@ -965,7 +1337,7 @@
       <div class="muted small">${esc(a.matricula)}${a.email ? ' · ' + esc(a.email) : ''}</div>
       ${(i => i ? `<div class="small">${esc(i.curso)} <span class="muted">· ingresso ${esc(i.ingresso)}</span></div>` : '')(CC.infoMatricula(a.matricula, cursos()))}
       ${a.ativo ? '' : '<span class="tag fora">fora da lista</span>'}</div>
-      <button class="btn small" id="editar">Editar</button></div>
+      <div class="stack" style="flex:none"><button class="btn small" id="editar">Editar</button>${a.email ? '<button class="btn small" id="mail-aluno">✉ E-mail</button>' : ''}</div></div>
       <div class="contadores"><span class="c-P">${st.P} P</span><span class="c-A">${st.A} A</span><span class="c-J">${st.J} J</span><span class="c-F">${st.F} F</span></div>
       <p class="small" style="margin:10px 0 0">Faltas: <b>${CC.numBR(st.faltas)}</b> de ${limTxt(t)} permitidas
       ${st.freq != null ? ' · frequência ' + Math.round(st.freq * 100) + '%' : ''}
@@ -980,13 +1352,14 @@
     h += `<div class="lista-chamada">` + (aulas.length ? aulas.map(aula => {
       const v = (t.presencas[aula.id] || {})[a.id];
       const o = (t.obs[aula.id] || {})[a.id];
-      return `<div class="aula-item" data-aula="${aula.id}"><div class="quando">${CC.fmtDate(aula.data)}<div class="dia">${CC.DIAS[CC.weekday(aula.data)]}</div></div>
+      return `<div class="aula-item" data-aula="${aula.id}"><div class="quando">${CC.fmtDate(aula.data)}<div class="dia">${CC.DIAS[CC.weekday(aula.data)]}${rotuloChamada(t, aula).replace(' · ', ' · ').replace(' chamada', '')}</div></div>
         <div class="grow small">${esc(aula.conteudo || '')}${o ? `<div class="muted">Obs.: ${esc(o)}</div>` : ''}</div>
         ${v ? `<span class="mini ${v}">${v}</span>` : '<span class="mini">–</span>'}</div>`;
     }).join('') : '<div class="empty">Nenhuma chamada feita ainda.</div>') + '</div>';
     app.innerHTML = h;
     setTopo(nomeCurto(a.nome), CC.nomeTurma(t), `#/t/${t.id}/alunos`, () => menuTurma(t));
     $('#editar').onclick = () => editarAluno(t, a);
+    const ma = $('#mail-aluno'); if (ma) ma.onclick = () => enviarEmail(t, [a]);
     app.querySelectorAll('[data-aula]').forEach(el => el.onclick = () => go(`#/t/${t.id}/chamada/${el.dataset.aula}`));
   }
 
@@ -1002,7 +1375,7 @@
       const feita = CC.aulaRealizada(t, aula);
       const c = feita ? CC.contarAula(t, aula) : null;
       return `<div class="aula-item ${aula.data === hoje ? 'hoje' : ''} ${aula.tipo}" data-id="${aula.id}">
-        <div class="quando">${CC.fmtDate(aula.data)}<div class="dia">${CC.DIAS[CC.weekday(aula.data)]}</div></div>
+        <div class="quando">${CC.fmtDate(aula.data)}<div class="dia">${CC.DIAS[CC.weekday(aula.data)]}${rotuloChamada(t, aula).replace(' · ', ' · ').replace(' chamada', '')}</div></div>
         <div class="grow"><div>${esc(aula.conteudo || (aula.tipo === 'aula' ? '' : CC.TIPOS[aula.tipo]))}</div>
         <div class="badge">${aula.tipo !== 'aula' ? CC.TIPOS[aula.tipo] : ''}${feita ? (aula.tipo !== 'aula' ? ' · ' : '') + c.P + ' P · ' + c.A + ' A · ' + c.J + ' J · ' + c.F + ' F' : ''}</div></div>
         ${aula.tipo !== 'sem-aula' ? `<button class="btn small" data-chamada="${aula.id}">${feita ? 'Ver' : 'Chamada'}</button>` : ''}</div>`;
@@ -1072,6 +1445,7 @@
 
   function telaNotas(t, avId) {
     const avs = t.avaliacoes;
+    let listaNotas = null;
     const vs = CC.avaliacaoTipo(t, 'VS'), vr = CC.avaliacaoTipo(t, 'VR');
     let h = `<div class="card"><div class="row"><div class="grow"><b>Avaliações</b>
       <div class="muted small">Média = soma(peso × nota ÷ máx. × 10) ÷ soma dos pesos${vr ? ' · VR substitui a prova perdida' : ''}${vs ? ` · média entre ${CC.numBR(t.config.mediaVS)} e ${CC.numBR(t.config.mediaMin)} faz VS` : ''}</div></div>
@@ -1096,12 +1470,18 @@
           <input type="text" inputmode="decimal" class="nota-input" data-aluno="${a.id}" value="${typeof n === 'number' ? String(n).replace('.', ',') : ''}" enterkeyhint="next"></div>`;
       }).join('') + '</div>';
     } else if (avs.length) {
-      h += tabelaNotas(t);
+      const lista = CC.alunosVisao(t, visaoDe(t), cursoDe);
+      h += cartaoEstatisticas(t) + barraVisao(t, CC.alunosOrdenados(t, false).length, lista) + tabelaNotas(t, lista);
+      listaNotas = lista;
     } else {
       h += `<div class="card empty">Defina o plano de avaliação (quantas provas, datas e pesos) para lançar as notas.</div>`;
     }
     app.innerHTML = h;
     $('#plano').onclick = () => editarPlano(t);
+    if (listaNotas) {
+      ligarBarraVisao(t, listaNotas);
+      app.querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => go(`#/t/${t.id}/aluno/${tr.dataset.id}`));
+    }
     if (av) {
       $('#edit-av').onclick = () => editarAvaliacao(t, av);
       const inputs = Array.from(app.querySelectorAll('.nota-input'));
@@ -1122,13 +1502,12 @@
     }
   }
 
-  function tabelaNotas(t) {
+  function tabelaNotas(t, lista) {
     const avs = t.avaliacoes;
     const vs = CC.avaliacaoTipo(t, 'VS');
     return `<div class="tabela-wrap"><table><thead><tr><th>Aluno</th>${avs.map(v => `<th class="num">${esc(v.nome)}</th>`).join('')}<th class="num">${vs ? 'MP' : 'Média'}</th>${vs ? '<th class="num">MF</th>' : ''}<th>Situação</th></tr></thead><tbody>` +
-      CC.alunosOrdenados(t, false).map(a => {
-        const st = CC.statsAluno(t, a);
-        return `<tr><td class="nome-cel">${esc(nomeCurto(a.nome))}</td>${avs.map(v => {
+      lista.map(({ a, st }) => {
+        return `<tr data-id="${a.id}" style="cursor:pointer"><td class="nome-cel">${esc(nomeCurto(a.nome))}</td>${avs.map(v => {
           const n = (t.notas[v.id] || {})[a.id];
           return `<td class="num">${typeof n === 'number' ? CC.numBR(n, n % 1 ? 1 : 0) : ''}</td>`;
         }).join('')}<td class="num"><b>${st.media != null ? CC.numBR(st.media) : ''}</b></td>
@@ -1178,27 +1557,31 @@
   /* ---------- tela: resumo ---------- */
 
   function telaResumo(t) {
-    const alunos = CC.alunosOrdenados(t, false);
+    const todos = CC.alunosOrdenados(t, false);
     const temNotas = t.avaliacoes.length > 0;
     const temVS = !!CC.avaliacaoTipo(t, 'VS');
-    const stats = alunos.map(a => ({ a, st: CC.statsAluno(t, a) }));
-    const rf = stats.filter(x => x.st.situacao.cod === 'RF').length;
-    const lim = stats.filter(x => x.st.situacao.cod === 'LIM').length;
+    const stats = CC.alunosVisao(t, visaoDe(t), cursoDe);
+    const todosStats = todos.map(a => CC.statsAluno(t, a));
+    const rf = todosStats.filter(s => s.situacao.cod === 'RF').length;
+    const lim = todosStats.filter(s => s.situacao.cod === 'LIM').length;
     const dadas = t.aulas.filter(a => CC.aulaRealizada(t, a)).length;
     let h = `<div class="card"><div class="row"><div class="grow">
       <b>${dadas}</b> de ${CC.aulasPrevistas(t)} aulas com chamada · máximo de <b>${limTxt(t)}</b> faltas
       <div class="muted small">${rf} reprovado(s) por falta · ${lim} perto do limite · atraso vale ${CC.numBR(t.config.pesoAtraso, 2)} falta</div>
       ${!(t.config.cargaHoraria > 0) ? `<div class="small" style="color:var(--A);margin-top:6px">Sem carga horária: o limite usa só as aulas do cronograma. Informe a carga nas configurações da turma.</div>` : ''}</div>
       <button class="btn small primary" id="exportar">Exportar .xlsx</button></div></div>`;
-    h += `<div class="tabela-wrap"><table><thead><tr><th>Aluno</th><th class="num">P</th><th class="num">A</th><th class="num">J</th><th class="num">F</th><th class="num">Faltas</th><th class="num">Freq.</th>${temNotas ? '<th class="num">Média</th>' : ''}${temVS ? '<th class="num">MF</th>' : ''}<th>Situação</th></tr></thead><tbody>` +
-      stats.map(({ a, st }) => `<tr data-id="${a.id}" style="cursor:pointer"><td class="nome-cel">${esc(nomeCurto(a.nome))}</td>
+    h += barraVisao(t, todos.length, stats);
+    h += `<div class="tabela-wrap"><table><thead><tr><th>Aluno</th><th class="num">P</th><th class="num">A</th><th class="num">J</th><th class="num">F</th><th class="num">Faltas</th><th class="num">Freq.</th>${temNotas ? `<th class="num">${temVS ? 'MP' : 'Média'}</th>` : ''}${temVS ? '<th class="num">MF</th>' : ''}<th>Situação</th></tr></thead><tbody>` +
+      (stats.length ? stats.map(({ a, st }) => `<tr data-id="${a.id}" style="cursor:pointer"><td class="nome-cel">${esc(nomeCurto(a.nome))}</td>
         <td class="num">${st.P}</td><td class="num">${st.A}</td><td class="num">${st.J}</td><td class="num">${st.F}</td>
         <td class="num"><b>${CC.numBR(st.faltas)}</b></td><td class="num">${st.freq != null ? Math.round(st.freq * 100) + '%' : ''}</td>
         ${temNotas ? `<td class="num">${st.media != null ? CC.numBR(st.media) : ''}</td>` : ''}${temVS ? `<td class="num">${st.mf != null ? CC.numBR(st.mf) : ''}</td>` : ''}
-        <td>${st.situacao.texto ? `<span class="tag ${st.situacao.cod}">${st.situacao.texto}</span>` : ''}</td></tr>`).join('') +
+        <td>${st.situacao.texto ? `<span class="tag ${st.situacao.cod}">${st.situacao.texto}</span>` : ''}</td></tr>`).join('')
+        : `<tr><td colspan="10" class="empty">Nenhum aluno neste filtro.</td></tr>`) +
       '</tbody></table></div>';
     app.innerHTML = h;
     $('#exportar').onclick = () => exportar(t, null);
+    ligarBarraVisao(t, stats);
     app.querySelectorAll('tr[data-id]').forEach(tr => tr.onclick = () => go(`#/t/${t.id}/aluno/${tr.dataset.id}`));
   }
 
