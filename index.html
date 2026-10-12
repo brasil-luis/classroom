@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Chamada</title>
+  <meta name="description" content="Chamada, presença, cronograma e notas das turmas.">
+  <meta name="theme-color" content="#1f5f8b">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="icon-btn" id="btn-voltar" aria-label="Voltar" hidden>&#8592;</button>
+    <div class="topbar-title">
+      <h1 id="titulo">Chamada</h1>
+      <div id="subtitulo" class="sub"></div>
+    </div>
+    <button class="icon-btn" id="btn-menu" aria-label="Menu" hidden>&#8942;</button>
+  </header>
+  <nav class="tabs" id="tabs" hidden></nav>
+  <main id="app"></main>
+  <div id="toast" role="status" aria-live="polite"></div>
+  <dialog id="dlg"><form method="dialog" id="dlg-form"></form></dialog>
+  <input type="file" id="file-input" hidden>
+
+  <!-- xlsx-js-style: SheetJS 0.18.5 com suporte a estilos na gravação -->
+  <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+  <script src="js/cursos-uff.js"></script>
+  <script src="js/core.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

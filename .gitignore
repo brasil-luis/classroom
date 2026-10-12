@@ -1,0 +1,9 @@
+# Planilhas com dados de alunos nunca entram no repositório
+*.xls
+*.xlsx
+*.ods
+*.csv
+*.json
+!manifest.webmanifest
+.DS_Store
+Thumbs.db
