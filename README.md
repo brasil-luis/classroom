@@ -3,7 +3,7 @@
 App web instalável (PWA) para fazer chamada pelo celular Android e organizar a turma.
 Funciona offline; os dados ficam só no aparelho.
 
-**Versão 0.4.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
+**Versão 0.7.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
 planejadas; aí vira 1.0.
 
 ## O que faz
@@ -51,7 +51,33 @@ planejadas; aí vira 1.0.
   limite de faltas aparece com o nome riscado. Dá para escolher quem entra: inscritos, só quem
   tem frequência, alunos para a VS (média parcial entre 4 e 6) ou para a VR (sem nota numa prova
   já feita), também os que saíram, uma faixa de média ou escolhidos à mão.
-- Backup/restauração em JSON.
+- **Tipos de aula** (ex.: Teórica, Laboratório) definidos por dia da semana, com troca à mão
+  em qualquer aula; aparecem na chamada, no cronograma e na planilha, e a tela do aluno mostra
+  as faltas por tipo.
+- **Instituição** da turma: na UFF o curso e o ingresso saem da matrícula; em outras, a
+  matrícula pode ter qualquer formato e a lista em PDF sai sem a coluna Curso.
+- **Graduação e pós na mesma turma.** Vínculo do aluno pela matrícula: 9 dígitos = graduação;
+  `M048.126.009` = Mestrado (D = Doutorado, A = avulso da pós). No começo do curso a pós aparece
+  com o CPF como matrícula provisória; ao atualizar a lista, o aluno é reconhecido (CPF, e-mail ou
+  nome) e passa para a matrícula definitiva. A pós não tem VS e pode ter outra média mínima.
+  Uma lista só da pós (ex.: a pauta do sistema da pós) não tira da turma os alunos da graduação.
+- A aba **Configuração** da planilha guarda a configuração da turma e é lida de volta ao
+  importar a planilha numa turma nova.
+- **Alunos de todas as turmas** (menu ⋮): cada pessoa identificada pelo **CPF** (sem CPF: matrícula, e-mail
+  ou nome completo), com as turmas em que esteve; na tela do aluno, o quadro "Em outras turmas" mostra o
+  histórico (situação e MF).
+- **Importar várias planilhas de uma vez** (turmas antigas): uma turma para cada, arquivando as de períodos
+  passados. Planilhas exportadas pelo app voltam completas: configuração, situação (inscrito / fora da
+  lista), CPF e e-mail (aba Alunos), plano de avaliação e notas (aba Notas).
+- **Várias listas oficiais de uma vez** (Atualizar lista): aplicadas em ordem de data (a do nome do arquivo,
+  ex. `…-2024jul08.xls`, ou a da última modificação); fica registrado quando cada aluno entrou e saiu.
+- **Importação assistida**: se o cabeçalho não for reconhecido, você escolhe a aba, a linha dos títulos e as
+  colunas de matrícula, nome, e-mail e CPF, com prévia e contagem ao vivo.
+- **Planilha que junta turmas**: ao importar numa turma com lista oficial, os alunos de outras turmas podem
+  ficar de fora (só entram marcações e notas de quem é da turma).
+- **Tema** da turma, para códigos genéricos ("Tópicos especiais em …").
+- Dados no **IndexedDB** (cabem dezenas de turmas), com cópia no localStorage enquanto couber.
+- Backup/restauração em JSON (cópia exata de tudo, para trocar de aparelho ou navegador).
 - Nomes de arquivo legíveis: `LFTC 2026-2 - planilha.xlsx`, `LFTC 2026-2 - lista de presença P1.pdf`,
   `LFTC 2026-2 - backup 2026-10-12.json` (o nome curto vem da sigla da disciplina + período e
   pode ser trocado nas configurações da turma).

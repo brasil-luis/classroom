@@ -11,7 +11,13 @@
   // Carga horária: disciplinas de 60, 64 ou 68 h com aulas de 2 h; por segurança, 68 h (34 aulas).
   // mediaVS: com média parcial entre mediaVS e mediaMin o aluno faz VS (padrão UFF: 4 a 6).
   // dias / inicio / fim: dias da semana das aulas (0 = dom) e período, para gerar o cronograma.
-  const DEFAULT_CONFIG = { pesoAtraso: 0.5, freqMin: 75, mediaMin: 6, mediaVS: 4, cargaHoraria: 68, horasAula: 2, dias: [], inicio: '', fim: '' };
+  // categorias / categoriaDia: tipos de aula (ex.: Teórica, Laboratório) e o tipo de cada dia da semana.
+  // mediaMinPos: média mínima dos alunos de pós (sem VS); null = a mesma da graduação.
+  const DEFAULT_CONFIG = { pesoAtraso: 0.5, freqMin: 75, mediaMin: 6, mediaVS: 4, mediaMinPos: null, cargaHoraria: 68, horasAula: 2, dias: [], inicio: '', fim: '', categorias: [], categoriaDia: {} };
+
+  /** Vínculo do aluno com a disciplina. Na pós da UFF a letra é o início da matrícula (M048.126.009). */
+  const VINCULOS = { G: 'Graduação', M: 'Mestrado', D: 'Doutorado', A: 'Avulso (pós)' };
+  const NIVEL_VINCULO = { G: 'grad', M: 'pos', D: 'pos', A: 'pos' };
   const TIPOS_AVALIACAO = { normal: 'Entra na média', VR: 'VR — reposição', VS: 'VS — suplementar' };
 
   function uid(prefix) {
@@ -117,20 +123,26 @@
 
   function findHeader(matrix) {
     for (let r = 0; r < Math.min(matrix.length, 40); r++) {
-      const row = matrix[r];
-      let mat = -1, nome = -1, cpf = -1, email = -1;
-      row.forEach((v, c) => {
-        if (typeof v !== 'string') return;
-        const n = norm(v);
-        if (mat < 0 && n.startsWith('MATR')) mat = c;
-        else if (cpf < 0 && n === 'CPF') cpf = c;
-        else if (nome < 0 && (n.includes('NOME') || n === 'ALUNO')) nome = c;
-        else if (email < 0 && n.includes('MAIL')) email = c;
-      });
-      if (nome >= 0 && (mat >= 0 || email >= 0)) return { row: r, mat, nome, cpf, email };
+      const h = cabecalhoDaLinha(matrix[r]);
+      if (h) return Object.assign({ row: r }, h);
     }
     return null;
   }
+
+  /** Colunas de Matrícula / Nome / CPF / E-mail, se a linha for um cabeçalho de lista de alunos. */
+  function cabecalhoDaLinha(row) {
+    let mat = -1, nome = -1, cpf = -1, email = -1;
+    (row || []).forEach((v, c) => {
+      if (typeof v !== 'string') return;
+      const n = norm(v);
+      if (mat < 0 && n.startsWith('MATR')) mat = c;
+      else if (cpf < 0 && n === 'CPF') cpf = c;
+      else if (nome < 0 && (n.includes('NOME') || n === 'ALUNO')) nome = c;
+      else if (email < 0 && n.includes('MAIL')) email = c;
+    });
+    return nome >= 0 && (mat >= 0 || email >= 0) ? { mat, nome, cpf, email } : null;
+  }
+
 
   function readMeta(matrix, upTo) {
     const meta = { disciplina: '', codigo: '', turma: '', periodo: '' };
@@ -156,6 +168,22 @@
     if (typeof v === 'string' && /^\d{8,9}$/.test(v.trim())) return v.trim().padStart(9, '0');
     return null;
   }
+
+  /** Matrícula da pós na UFF: letra do vínculo + programa + semestre/ano + ordem (M048.126.009). */
+  function matriculaPos(v) {
+    const s = String(v == null ? '' : v).trim().toUpperCase();
+    return /^[AMD]\d{3}\.?\d{3}\.?\d{3}$/.test(s) ? s : null;
+  }
+
+  /** CPF válido (dígitos verificadores): no começo do curso, é a matrícula provisória dos alunos de pós. */
+  function cpfValido(v) {
+    const s = String(v == null ? '' : v).replace(/\D/g, '').padStart(11, '0');
+    if (!/^\d{11}$/.test(s) || /^(\d)\1{10}$/.test(s) || String(v).replace(/\D/g, '').length < 10) return null;
+    const dv = n => { let soma = 0; for (let i = 0; i < n; i++) soma += +s[i] * (n + 1 - i); const r = soma * 10 % 11; return r === 10 ? 0 : r; };
+    return dv(9) === +s[9] && dv(10) === +s[10] ? s : null;
+  }
+
+  const provisoria = m => /^\d{11}$/.test(m || '');
 
   function looksLikeName(v) {
     return typeof v === 'string' && !v.includes('@') && /[A-Za-zÀ-ÿ]{2,}\s+[A-Za-zÀ-ÿ]/.test(v);
@@ -187,23 +215,39 @@
    *  - colunas de notas (cabeçalho de texto com valores numéricos);
    *  - uma aba "cronograma" (data + conteúdo).
    */
-  function parseWorkbook(XLSX, wb) {
+  /**
+   * opcoes (importação assistida): { aba, cabecalho: { row, mat, nome, cpf, email } } — colunas escolhidas
+   * pela pessoa quando o cabeçalho não é reconhecido (row = -1: não há linha de títulos).
+   */
+  function parseWorkbook(XLSX, wb, opcoes) {
     const date1904 = !!(wb.Workbook && wb.Workbook.WBProps && wb.Workbook.WBProps.date1904);
     const result = {
       meta: { disciplina: '', codigo: '', turma: '', periodo: '' },
       alunos: [], datas: [], notas: [], cronograma: [], sheetName: null, avisos: []
     };
+    const forcado = !!(opcoes && opcoes.cabecalho && opcoes.aba && wb.Sheets[opcoes.aba]);
 
     let main = null;
-    for (const name of wb.SheetNames) {
-      const matrix = sheetMatrix(XLSX, wb.Sheets[name]);
-      const header = findHeader(matrix);
-      if (header) { main = { name, matrix, header }; break; }
+    if (forcado) {
+      main = { name: opcoes.aba, matrix: sheetMatrix(XLSX, wb.Sheets[opcoes.aba]), header: Object.assign({ cpf: -1, email: -1 }, opcoes.cabecalho) };
+    } else {
+      for (const name of wb.SheetNames) {
+        const matrix = sheetMatrix(XLSX, wb.Sheets[name]);
+        const header = findHeader(matrix);
+        if (header) { main = { name, matrix, header }; break; }
+      }
     }
 
     for (const name of wb.SheetNames) {
       if (norm(name).includes('CRONO')) {
         result.cronograma = parseCronograma(sheetMatrix(XLSX, wb.Sheets[name]), date1904);
+      }
+      if (norm(name).startsWith('CONFIGURA')) {
+        result.configuracao = parseConfiguracao(sheetMatrix(XLSX, wb.Sheets[name]), date1904);
+      }
+      if (norm(name) === 'NOTAS') {
+        const n = parseNotasApp(sheetMatrix(XLSX, wb.Sheets[name]), date1904);
+        if (n) result.notasApp = n;
       }
     }
 
@@ -215,8 +259,12 @@
     const { matrix, header } = main;
     result.sheetName = main.name;
     result.meta = readMeta(matrix, header.row);
+    // Planilha exportada pelo app: disciplina, código, turma e período vêm da aba Configuração.
+    if (result.configuracao) {
+      Object.keys(result.configuracao.meta).forEach(k => { if (!result.meta[k]) result.meta[k] = result.configuracao.meta[k]; });
+    }
     const anoPadrao = parseInt(String(result.meta.periodo).slice(0, 4), 10) || new Date().getFullYear();
-    const hrow = matrix[header.row];
+    const hrow = matrix[header.row] || [];
     const idCols = [header.mat, header.nome, header.cpf, header.email];
 
     const dateCols = [];
@@ -230,21 +278,39 @@
     // Datas: só as do bloco principal (até a primeira coluna vazia de cabeçalho depois das datas).
     result.datas = dateCols.map(d => d.iso);
 
+    // Planilha sem nenhuma matrícula no formato UFF: vale o código que estiver na coluna "Matrícula".
+    const matGenerica = header.mat >= 0 && (forcado || !matrix.slice(header.row + 1).some(row => row && row.some(v => asMatricula(v))));
+    const codigoGenerico = v => {
+      const s = String(v == null ? '' : v).trim();
+      return /^[A-Za-z0-9./-]{3,20}$/.test(s) && /\d/.test(s) ? s : null;
+    };
+
+    const matDe = v => asMatricula(v) || matriculaPos(v);
+
     const dataRows = [];
+    // Outra lista colada abaixo (ex.: a pauta da pós sob a lista da graduação) tem cabeçalho próprio;
+    // dela só vêm os alunos (sem chamada nem notas).
+    let bloco = header, principal = true;
     for (let r = header.row + 1; r < matrix.length; r++) {
       const row = matrix[r];
       if (row.every(isBlank)) continue;
+      const outroCab = forcado ? null : cabecalhoDaLinha(row);
+      if (outroCab) { bloco = outroCab; principal = false; continue; }
 
       let k = -1;
       row.forEach((v, c) => {
-        if (c === header.cpf || dateCols.some(d => d.c === c)) return;
-        if (asMatricula(v)) k = c;
+        if (c === bloco.cpf || (principal && dateCols.some(d => d.c === c))) return;
+        if (matDe(v)) k = c;
       });
+      if (forcado && bloco.mat >= 0 && !isBlank(row[bloco.mat]) && (matDe(row[bloco.mat]) || codigoGenerico(row[bloco.mat]))) k = bloco.mat;
+      if (k < 0 && bloco.mat >= 0 && cpfValido(row[bloco.mat])) k = bloco.mat;   // matrícula provisória
+      if (k < 0 && matGenerica && codigoGenerico(row[bloco.mat])) k = bloco.mat;
 
       const aluno = { matricula: '', cpf: '', nome: '', email: '', presencas: [], notas: {} };
       if (k >= 0) {
-        aluno.matricula = asMatricula(row[k]);
-        const fromHeader = k === header.mat;
+        aluno.matricula = matDe(row[k]) || cpfValido(row[k]) || codigoGenerico(row[k]);
+        if (provisoria(aluno.matricula)) aluno.cpf = aluno.matricula;
+        const fromHeader = k === bloco.mat;
         aluno.fonte = fromHeader ? 'cabecalho' : 'direita';
         for (let c = k + 1; c <= k + 4 && c < row.length; c++) {
           const v = row[c];
@@ -252,23 +318,29 @@
           else if (!aluno.email && typeof v === 'string' && v.includes('@')) aluno.email = v.trim();
           else if (!aluno.cpf && /^\d{10,11}$/.test(String(v || '').trim())) aluno.cpf = String(v).trim().padStart(11, '0');
         }
-        if (!aluno.nome && looksLikeName(row[header.nome])) aluno.nome = row[header.nome].trim();
+        if (!aluno.nome && looksLikeName(row[bloco.nome])) aluno.nome = row[bloco.nome].trim();
+        if (!aluno.nome && forcado && typeof row[bloco.nome] === 'string') aluno.nome = row[bloco.nome].trim();
         if (fromHeader) {
-          if (!aluno.email && header.email >= 0 && !isBlank(row[header.email])) aluno.email = String(row[header.email]).trim();
-          if (!aluno.cpf && header.cpf >= 0 && !isBlank(row[header.cpf])) aluno.cpf = String(row[header.cpf]).trim().padStart(11, '0');
+          if (!aluno.email && bloco.email >= 0 && !isBlank(row[bloco.email])) aluno.email = String(row[bloco.email]).trim();
+          if (!aluno.cpf && bloco.cpf >= 0 && !isBlank(row[bloco.cpf])) aluno.cpf = String(row[bloco.cpf]).trim().padStart(11, '0');
         }
-      } else if (looksLikeName(row[header.nome])) {
-        aluno.nome = row[header.nome].trim();
-        if (header.email >= 0 && typeof row[header.email] === 'string') aluno.email = row[header.email].trim();
+      } else if (looksLikeName(row[bloco.nome]) || (forcado && typeof row[bloco.nome] === 'string' && /[A-Za-zÀ-ÿ]{2}/.test(row[bloco.nome]))) {
+        aluno.nome = row[bloco.nome].trim();
+        if (bloco.email >= 0 && typeof row[bloco.email] === 'string') aluno.email = row[bloco.email].trim();
       } else {
         continue;
       }
       if (!aluno.nome && !aluno.matricula) continue;
 
-      aluno.presencas = dateCols.map(d => presenceValue(row[d.c]));
-      textCols.forEach(t => {
+      aluno.presencas = dateCols.map(d => !principal || isBlank(row[d.c]) ? null : presenceValue(row[d.c]));
+      if (principal) textCols.forEach(t => {
         const v = row[t.c];
         if (typeof v === 'number') aluno.notas[t.c] = v;
+        // Coluna "Situação" da planilha exportada pelo app: inscrito / fora da lista (dd/mm/aaaa)
+        else if (typeof v === 'string' && norm(t.nome) === 'SITUACAO') {
+          const m = norm(v).match(/^(INSCRITO|FORA DA LISTA)\s*(?:\((.*)\))?/);
+          if (m) { aluno.situacaoLista = m[1] === 'INSCRITO' ? 'inscrito' : 'fora'; if (m[2]) aluno.saiuEm = cellToISO(m[2].trim(), date1904) || m[2].trim().toLowerCase(); }
+        }
       });
       dataRows.push(aluno);
     }
@@ -287,6 +359,13 @@
     }
     dataRows.forEach(a => { delete a.fonte; });
 
+    // Coluna de data toda vazia = chamada ainda não feita (ex.: aulas futuras da planilha exportada);
+    // nas demais, célula vazia continua valendo falta.
+    dateCols.forEach((d, j) => {
+      if (!dataRows.some(a => a.presencas[j])) return;
+      dataRows.forEach(a => { if (!a.presencas[j]) a.presencas[j] = 'F'; });
+    });
+
     // Uma mesma matrícula repetida (linhas desalinhadas): fica a primeira ocorrência com nome.
     const seen = new Set();
     result.alunos = dataRows.filter(a => {
@@ -296,9 +375,10 @@
       return true;
     });
 
-    const ignorar = /FALTA|FREQ|TOTAL|SITUA|^MF$|MEDIA|OBS/;
+    const ignorar = /FALTA|FREQ|TOTAL|SITUA|^MF$|^MP$|^MT$|^M$|MEDIA|OBS/;   // médias calculadas não são avaliações
+    const naoNota = /^N[º°O.]?$|^NUM|BOLSISTA|^#$|^ORDEM$|^INSCR|CADASTRO|MOODLE|^PRESENCAS?$/;   // ordem, cadastro etc.: nem aparece como nota
     result.notas = textCols
-      .filter(t => result.alunos.some(a => typeof a.notas[t.c] === 'number'))
+      .filter(t => !naoNota.test(norm(t.nome)) && result.alunos.some(a => typeof a.notas[t.c] === 'number'))
       .map(t => {
         const vals = result.alunos.map(a => a.notas[t.c]).filter(v => typeof v === 'number');
         const maxVal = Math.max.apply(null, vals);
@@ -309,11 +389,46 @@
         };
       });
 
+    // Planilha exportada pelo app: CPF e e-mail ficam na aba "Alunos" (a aba principal é a Chamada).
+    for (const name of wb.SheetNames) {
+      if (name === main.name || norm(name) !== 'ALUNOS') continue;
+      const m = sheetMatrix(XLSX, wb.Sheets[name]);
+      const h = findHeader(m);
+      if (!h || h.cpf < 0) continue;
+      for (let r = h.row + 1; r < m.length; r++) {
+        const row = m[r] || [];
+        const mat = h.mat >= 0 ? (asMatricula(row[h.mat]) || matriculaPos(row[h.mat]) || String(row[h.mat] || '').trim()) : '';
+        const nome = typeof row[h.nome] === 'string' ? row[h.nome].trim() : '';
+        const cpf = isBlank(row[h.cpf]) ? '' : String(row[h.cpf]).replace(/\D/g, '').padStart(11, '0');
+        const email = h.email >= 0 && typeof row[h.email] === 'string' ? row[h.email].trim() : '';
+        const a = result.alunos.find(x => (mat && x.matricula === mat) || (!mat && nome && norm(x.nome) === norm(nome)));
+        if (!a) continue;
+        if (!a.cpf && /^\d{11}$/.test(cpf) && cpf !== '00000000000') a.cpf = cpf;
+        if (!a.email && email) a.email = email;
+      }
+    }
+
     if (!result.alunos.length) result.avisos.push('Nenhum aluno encontrado abaixo do cabeçalho.');
     return result;
   }
 
   function parseCronograma(matrix, date1904) {
+    // Com cabeçalho "Data" e "Conteúdo" (ex.: o cronograma exportado pelo app): lê coluna por coluna.
+    const hr = matrix.findIndex(row => row && row.some(v => norm(v) === 'CONTEUDO') && row.some(v => norm(v) === 'DATA'));
+    if (hr >= 0) {
+      const h = matrix[hr].map(v => norm(v));
+      const cData = h.indexOf('DATA'), cCont = h.indexOf('CONTEUDO'), cTipo = h.indexOf('TIPO'), cCat = h.indexOf('TIPO DE AULA');
+      const tipoDe = {};
+      Object.keys(TIPOS).forEach(k => { tipoDe[norm(TIPOS[k])] = k; });
+      return matrix.slice(hr + 1).map(row => {
+        const iso = row && cellToISO(row[cData], date1904);
+        if (!iso) return null;
+        const conteudo = row[cCont] == null ? '' : String(row[cCont]).trim();
+        const item = { data: iso, conteudo, tipo: (cTipo >= 0 && tipoDe[norm(row[cTipo])]) || tipoFromConteudo(conteudo) };
+        if (cCat >= 0 && !isBlank(row[cCat])) item.categoria = String(row[cCat]).trim();
+        return item;
+      }).filter(Boolean);
+    }
     const out = [];
     matrix.forEach(row => {
       let iso = null, idx = -1;
@@ -331,6 +446,75 @@
     return out;
   }
 
+  /** Aba "Configuração" exportada pelo app (rótulo | valor): devolve meta, instituição, nome curto e config. */
+  function parseConfiguracao(matrix, date1904) {
+    const r = { meta: {}, config: {} };
+    const num = v => { const x = typeof v === 'number' ? v : parseFloat(String(v).replace(',', '.')); return isNaN(x) ? null : x; };
+    const diaDe = s => DIAS.findIndex(d => norm(d) === norm(s).slice(0, 3));
+    matrix.forEach(row => {
+      if (!row || typeof row[0] !== 'string') return;
+      const k = norm(row[0]), v = row[1];
+      if (isBlank(v) || String(v).trim() === '—') return;
+      const txt = String(v).trim();
+      const n = num(v);
+      if (k === 'INSTITUICAO') r.instituicao = txt;
+      else if (k === 'NOME CURTO') r.nomeCurto = txt;
+      else if (k === 'TEMA') r.tema = txt;
+      else if (k === 'DISCIPLINA') r.meta.disciplina = txt;
+      else if (k === 'CODIGO') r.meta.codigo = txt;
+      else if (k === 'TURMA') r.meta.turma = txt;
+      else if (k === 'PERIODO') r.meta.periodo = txt;
+      else if (k.startsWith('CARGA HORARIA') && n != null) r.config.cargaHoraria = n;
+      else if (k === 'HORAS POR AULA' && n != null) r.config.horasAula = n;
+      else if (k.startsWith('FREQUENCIA MINIMA') && n != null) r.config.freqMin = n;
+      else if (k.startsWith('PESO DO ATRASO') && n != null) r.config.pesoAtraso = n;
+      else if (k === 'MEDIA MINIMA' && n != null) r.config.mediaMin = n;
+      else if (k.startsWith('MEDIA PARA FAZER VS') && n != null) r.config.mediaVS = n;
+      else if (k.startsWith('MEDIA MINIMA NA POS') && n != null) r.config.mediaMinPos = n;
+      else if (k === 'DIAS DE AULA') r.config.dias = txt.split(/[,;·]/).map(diaDe).filter(d => d >= 0);
+      else if (k === 'INICIO DAS AULAS') r.config.inicio = cellToISO(v, date1904) || '';
+      else if (k === 'FIM DAS AULAS') r.config.fim = cellToISO(v, date1904) || '';
+      else if (k === 'TIPOS DE AULA') r.config.categorias = txt.split(/[,;]/).map(x => x.trim()).filter(Boolean);
+      else if (k === 'TIPO DE AULA POR DIA') {
+        r.config.categoriaDia = {};
+        txt.split('·').forEach(par => {
+          const m = par.match(/^\s*([^:]+):\s*(.+?)\s*$/);
+          if (m && diaDe(m[1]) >= 0) r.config.categoriaDia[diaDe(m[1])] = m[2];
+        });
+      }
+    });
+    return r;
+  }
+
+  /** Aba "Notas" exportada pelo app: linhas Peso / Nota máxima / Data e uma coluna por avaliação. */
+  function parseNotasApp(matrix, date1904) {
+    const acha = rot => matrix.findIndex(r => r && r.some(v => typeof v === 'string' && norm(v) === rot));
+    const lPeso = acha('PESO'), lMax = acha('NOTA MAXIMA'), lData = acha('DATA');
+    const lCab = matrix.findIndex(r => r && typeof r[0] === 'string' && norm(r[0]).startsWith('MATR'));
+    if (lPeso < 0 || lMax < 0 || lCab < 0) return null;
+    const cab = matrix[lCab], cols = [];
+    cab.forEach((h, c) => {
+      if (typeof h !== 'string' || c < 2 || /^(MATR|NOME|CURSO|MP|MF|MEDIA|FALTAS|SITUA)/.test(norm(h))) return;
+      const nome = h.trim();
+      const tipo = /^(VR|VS)$/.test(norm(nome)) ? norm(nome) : 'normal';
+      const peso = matrix[lPeso][c], max = matrix[lMax][c], data = lData >= 0 ? matrix[lData][c] : null;
+      cols.push({ c, nome, tipo, peso: typeof peso === 'number' ? peso : (tipo === 'normal' ? 1 : 0),
+        max: typeof max === 'number' && max > 0 ? max : 10, data: cellToISO(data, date1904) || '' });
+    });
+    if (!cols.length) return null;
+    const alunos = [];
+    for (let r = lCab + 1; r < matrix.length; r++) {
+      const row = matrix[r] || [];
+      const mat = isBlank(row[0]) ? '' : (asMatricula(row[0]) || matriculaPos(row[0]) || String(row[0]).trim());
+      const nome = typeof row[1] === 'string' ? row[1].trim() : '';
+      if (!mat && !nome) continue;
+      const notas = {};
+      cols.forEach(x => { if (typeof row[x.c] === 'number') notas[x.nome] = row[x.c]; });
+      alunos.push({ matricula: mat, nome, notas });
+    }
+    return { plano: cols.map(({ nome, tipo, peso, max, data }) => ({ nome, tipo, peso, max, data })), alunos };
+  }
+
   /* ---------- modelo ---------- */
 
   function novaTurma(meta) {
@@ -340,6 +524,7 @@
       codigo: meta.codigo || '',
       turma: meta.turma || '',
       periodo: meta.periodo || '',
+      instituicao: meta.instituicao || '',
       criadaEm: todayISO(),
       listaEm: null,
       config: Object.assign({}, DEFAULT_CONFIG),
@@ -352,9 +537,20 @@
     };
   }
 
+  /** Turma da UFF (ou sem instituição definida, como as antigas): a matrícula diz curso e ingresso. */
+  function ehUFF(t) {
+    const i = norm(t && t.instituicao);
+    return !i || /\bUFF\b|FLUMINENSE/.test(i);
+  }
+
+  /** Disciplina com o tema (disciplinas de código genérico, como "Tópicos especiais em …"). */
+  function disciplinaTema(t) {
+    return t.tema ? t.disciplina + ' — ' + t.tema : t.disciplina;
+  }
+
   function nomeTurma(t) {
     const partes = [t.codigo, t.turma].filter(Boolean).join(' ');
-    return partes ? partes + ' — ' + t.disciplina : t.disciplina;
+    return partes ? partes + ' — ' + disciplinaTema(t) : disciplinaTema(t);
   }
 
   function sortAlunos(list) {
@@ -388,14 +584,40 @@
       const n = norm(dado.nome);
       if (!n) return null;
       return t.alunos.find(a => norm(a.nome) === n) ||
-        t.alunos.find(a => nomesCompativeis(a.nome, dado.nome) && (!a.matricula || !dado.matricula || conferirNome)) || null;
+        t.alunos.find(a => nomesCompativeis(a.nome, dado.nome) &&
+          (!a.matricula || !dado.matricula || conferirNome || provisoria(a.matricula) || provisoria(dado.matricula))) || null;
     };
     if (dado.matricula) {
       const m = t.alunos.find(a => a.matricula === dado.matricula);
       if (m && (!conferirNome || !dado.nome || nomesCompativeis(m.nome, dado.nome))) return m;
       if (m && conferirNome) return porNome();
     }
+    // Aluno de pós que trocou a matrícula provisória (CPF) pela definitiva, ou o contrário.
+    const cpf = dado.cpf || (provisoria(dado.matricula) ? dado.matricula : '');
+    if (cpf) {
+      const m = t.alunos.find(a => a.cpf === cpf || a.matricula === cpf);
+      if (m) return m;
+    }
+    if (dado.email) {
+      const m = t.alunos.find(a => a.email && a.email.toLowerCase() === dado.email.toLowerCase());
+      if (m && (!dado.nome || nomesCompativeis(m.nome, dado.nome))) return m;
+    }
     return porNome();
+  }
+
+  /** Troca a matrícula, sem voltar da definitiva para a provisória (CPF), que fica guardada como CPF. */
+  function atualizarMatricula(a, nova) {
+    if (!nova || nova === a.matricula) return;
+    if (provisoria(nova) && a.matricula && !provisoria(a.matricula)) { if (!a.cpf) a.cpf = nova; return; }
+    if (provisoria(a.matricula) && !a.cpf) a.cpf = a.matricula;
+    a.matricula = nova;
+  }
+
+  /** Nível (graduação ou pós) de quem aparece numa lista importada, pela matrícula. */
+  function nivelDado(t, dado) {
+    if (!ehUFF(t)) return 'grad';
+    const i = infoMatricula(dado.matricula, {});
+    return i ? i.nivel : 'grad';
   }
 
   /**
@@ -414,18 +636,21 @@
       const mud = [];
       if (dado.nome && dado.nome !== a.nome && norm(dado.nome) !== norm(a.nome)) mud.push('nome');
       if (dado.email && dado.email !== a.email) mud.push('e-mail');
-      if (dado.matricula && dado.matricula !== a.matricula) mud.push('matrícula');
+      if (dado.matricula && dado.matricula !== a.matricula && !(provisoria(dado.matricula) && !provisoria(a.matricula))) mud.push('matrícula');
       if (mud.length) plano.alterados.push({ aluno: a, dado, campos: mud });
       else plano.mantidos++;
     });
+    // Lista só da pós (ou só da graduação): só os alunos desse nível podem sair da turma.
+    const niveis = new Set(parsed.alunos.map(d => nivelDado(t, d)));
     t.alunos.forEach(a => {
-      if (a.ativo && !vistos.has(a.id) && a.origem !== 'manual') plano.saem.push(a);
+      if (a.ativo && !vistos.has(a.id) && a.origem !== 'manual' && niveis.has(nivelAluno(t, a))) plano.saem.push(a);
     });
     return plano;
   }
 
-  function aplicarLista(t, parsed) {
-    const hoje = todayISO();
+  /** dataLista: data da lista (ex.: tirada do nome do arquivo) — vira a data de entrada/saída dos alunos. */
+  function aplicarLista(t, parsed, dataLista) {
+    const hoje = dataLista || todayISO();
     const plano = diffLista(t, parsed);
     parsed.alunos.forEach(dado => {
       let a = findAluno(t, dado);
@@ -441,7 +666,7 @@
       if (dado.nome) a.nome = dado.nome;
       if (dado.email) a.email = dado.email;
       if (dado.cpf) a.cpf = dado.cpf;
-      if (dado.matricula) a.matricula = dado.matricula;
+      atualizarMatricula(a, dado.matricula);
       a.ativo = true;
       a.saiuEm = null;
       if (a.origem === 'manual') a.origem = 'lista';
@@ -458,12 +683,27 @@
     return o;
   }
 
+  /** Tipo de aula (categoria) que o dia da semana da data tem na configuração da turma. */
+  function categoriaPadrao(t, iso) {
+    const cat = (t.config.categoriaDia || {})[weekday(iso)] || '';
+    return (t.config.categorias || []).includes(cat) ? cat : '';
+  }
+
+  /** Reaplica o tipo de aula por dia da semana (menos nas aulas em que foi escolhido à mão). */
+  function aplicarCategorias(t) {
+    t.aulas.forEach(a => {
+      if (a.categoriaFixa && (t.config.categorias || []).includes(a.categoria)) return;
+      delete a.categoriaFixa;
+      a.categoria = categoriaPadrao(t, a.data);
+    });
+  }
+
   /** Acha (ou cria) a n-ésima aula de uma data. */
   function aulaDaData(t, iso, n, criar, conteudo) {
     const doDia = aulasOrdenadas(t).filter(a => a.data === iso);
     if (doDia[n || 0]) return doDia[n || 0];
     if (!criar) return null;
-    const aula = { id: uid('d'), data: iso, conteudo: conteudo || '', tipo: tipoFromConteudo(conteudo || ''), ordem: doDia.length };
+    const aula = { id: uid('d'), data: iso, conteudo: conteudo || '', tipo: tipoFromConteudo(conteudo || ''), ordem: doDia.length, categoria: categoriaPadrao(t, iso) };
     t.aulas.push(aula);
     return aula;
   }
@@ -473,7 +713,7 @@
    * Nunca sobrescreve uma marcação já feita no app: só preenche o que está vazio.
    */
   function importarDados(t, parsed, opcoes) {
-    const o = Object.assign({ alunos: true, chamada: true, cronograma: true, notas: [] }, opcoes);
+    const o = Object.assign({ alunos: true, chamada: true, cronograma: true, notas: [], notasApp: true }, opcoes);
     const res = { alunosNovos: 0, marcacoes: 0, aulasNovas: 0, notas: 0 };
     const temLista = !!t.listaEm;
 
@@ -481,7 +721,11 @@
       parsed.cronograma.forEach(item => {
         const antes = t.aulas.length;
         const aula = aulaDaData(t, item.data, 0, true, item.conteudo);
-        if (t.aulas.length > antes) res.aulasNovas++;
+        if (item.categoria && !aula.categoriaFixa && item.categoria !== categoriaPadrao(t, item.data)) {
+          aula.categoria = item.categoria;
+          aula.categoriaFixa = true;
+        }
+        if (t.aulas.length > antes) { res.aulasNovas++; aula.tipo = item.tipo; }
         else if (!aula.conteudo && item.conteudo) {
           aula.conteudo = item.conteudo;
           // Uma aula que já tem chamada não vira "sem aula".
@@ -516,8 +760,8 @@
         if (!o.alunos) return;
         a = {
           id: uid('a'), matricula: dado.matSuspeita ? '' : dado.matricula, cpf: dado.matSuspeita ? '' : dado.cpf, nome: dado.nome,
-          email: dado.email, origem: 'planilha', ativo: !temLista, entrouEm: todayISO(),
-          saiuEm: temLista ? 'antes de ' + fmtDate(t.listaEm) : null
+          email: dado.email, origem: 'planilha', ativo: dado.situacaoLista ? dado.situacaoLista === 'inscrito' : !temLista, entrouEm: todayISO(),
+          saiuEm: dado.situacaoLista === 'fora' ? (dado.saiuEm || null) : (dado.situacaoLista ? null : temLista ? 'antes de ' + fmtDate(t.listaEm) : null)
         };
         t.alunos.push(a);
         res.alunosNovos++;
@@ -525,11 +769,11 @@
         if (!a.email && dado.email) a.email = dado.email;
         if (!dado.matSuspeita) {
           if (!a.cpf && dado.cpf) a.cpf = dado.cpf;
-          if (!a.matricula && dado.matricula) a.matricula = dado.matricula;
+          if (!a.matricula || provisoria(a.matricula)) atualizarMatricula(a, dado.matricula);
         }
       }
       aulasCols.forEach((aula, i) => {
-        if (!aula) return;
+        if (!aula || !dado.presencas[i]) return;
         const marc = t.presencas[aula.id] || (t.presencas[aula.id] = {});
         if (!marc[a.id]) { marc[a.id] = dado.presencas[i]; res.marcacoes++; }
       });
@@ -541,9 +785,57 @@
       });
     });
 
+    // Plano de avaliação e notas da aba "Notas" (planilha exportada pelo app).
+    if (o.notasApp && parsed.notasApp) {
+      const na = parsed.notasApp;
+      if (!avaliacoesMedia(t).length) aplicarPlano(t, na.plano);
+      else na.plano.forEach(item => {
+        if (!t.avaliacoes.some(v => norm(v.nome) === norm(item.nome))) t.avaliacoes.push(Object.assign({ id: uid('v') }, item));
+      });
+      na.alunos.forEach(dado => {
+        const a = findAluno(t, dado);
+        if (!a) return;
+        Object.keys(dado.notas).forEach(nome => {
+          const v = t.avaliacoes.find(x => norm(x.nome) === norm(nome));
+          if (!v) return;
+          const notas = t.notas[v.id] || (t.notas[v.id] = {});
+          if (notas[a.id] == null) { notas[a.id] = dado.notas[nome]; res.notas++; }
+        });
+      });
+    }
+
     if (!t.codigo && parsed.meta.codigo) Object.assign(t, metaSemVazios(parsed.meta));
+    corrigirMatriculasAntigas(t);
     sincronizarAvaliacoes(t);
     return res;
+  }
+
+  /** Até 2010 a matrícula da UFF tinha 8 dígitos; o leitor completa números de 8 dígitos com zero à esquerda. */
+  function corrigirMatriculasAntigas(t) {
+    const ano = parseInt(String(t.periodo || '').slice(0, 4), 10);
+    if (!ano || ano > 2010) return;
+    t.alunos.forEach(a => { if (/^0\d{8}$/.test(a.matricula || '')) a.matricula = a.matricula.slice(1); });
+  }
+
+  /**
+   * Turma nova a partir de uma planilha (lista oficial, planilha de controle ou exportação do app).
+   * Usa a aba Configuração, o plano/notas da aba Notas, a chamada e o cronograma.
+   */
+  function turmaDePlanilha(p, extra) {
+    const cfg = p.configuracao || { meta: {}, config: {} };
+    const t = novaTurma(Object.assign({}, p.meta, { instituicao: cfg.instituicao || (extra && extra.instituicao) || '' }));
+    Object.keys(cfg.config).forEach(k => { if (cfg.config[k] != null) t.config[k] = cfg.config[k]; });
+    if (cfg.nomeCurto) t.nomeCurto = cfg.nomeCurto;
+    if (cfg.tema) t.tema = cfg.tema;
+    const soLista = !p.datas.length && !p.cronograma.length && !p.notas.length && !p.notasApp;
+    if (soLista) aplicarLista(t, p, extra && extra.dataLista);
+    else {
+      importarDados(t, p, { alunos: true, chamada: true, cronograma: true, notas: p.notas.filter(n => n.sugerida) });
+      if (p.alunos.some(d => d.situacaoLista)) t.listaEm = (extra && extra.dataLista) || todayISO();
+    }
+    aplicarCategorias(t);
+    corrigirMatriculasAntigas(t);
+    return t;
   }
 
   /** Gera aulas entre duas datas nos dias da semana escolhidos (0 = domingo). */
@@ -605,15 +897,22 @@
   }
 
   function statsAluno(t, aluno) {
-    const s = { P: 0, A: 0, J: 0, F: 0, registradas: 0 };
+    const s = { P: 0, A: 0, J: 0, F: 0, registradas: 0, porCategoria: {} };
     t.aulas.forEach(aula => {
       if (aula.tipo === 'sem-aula') return;
       const v = (t.presencas[aula.id] || {})[aluno.id];
-      if (v) { s[v]++; s.registradas++; }
+      if (!v) return;
+      s[v]++; s.registradas++;
+      if (aula.categoria) {
+        const c = s.porCategoria[aula.categoria] || (s.porCategoria[aula.categoria] = { aulas: 0, faltas: 0 });
+        c.aulas++;
+        c.faltas += v === 'F' ? 1 : v === 'A' ? t.config.pesoAtraso : 0;
+      }
     });
     s.faltas = s.F + t.config.pesoAtraso * s.A;
     s.freq = s.registradas ? 1 - s.faltas / s.registradas : null;
     s.limite = limiteFaltas(t);
+    s.nivel = nivelAluno(t, aluno);
     s.media = mediaAluno(t, aluno);
     s.mf = mediaFinal(t, aluno, s.media);
     s.situacao = situacao(t, s);
@@ -661,6 +960,7 @@
    *  (null enquanto não houver); abaixo de mediaVS → MP. Sem VS no plano, MF = MP. */
   function mediaFinal(t, aluno, mp) {
     if (mp == null) return null;
+    if (nivelAluno(t, aluno) === 'pos') return mp;   // pós não tem VS
     const vs = avaliacaoTipo(t, 'VS');
     if (!vs || mp >= t.config.mediaMin || mp < t.config.mediaVS) return mp;
     const n = notaDez(t, vs, aluno);
@@ -671,9 +971,10 @@
     if (reprovadoPorFalta(t, s.faltas)) return { cod: 'RF', texto: 'Reprovado por falta' };
     if (s.limite > 0 && s.faltas >= s.limite - 1) return { cod: 'LIM', texto: 'Perto do limite de faltas' };
     if (s.media == null) return { cod: '', texto: '' };
-    const min = t.config.mediaMin;
+    const pos = s.nivel === 'pos';
+    const min = pos ? mediaMinPos(t) : t.config.mediaMin;
     if (s.media >= min) return { cod: 'OK', texto: 'Média suficiente' };
-    if (avaliacaoTipo(t, 'VS') && s.media >= t.config.mediaVS) {
+    if (!pos && avaliacaoTipo(t, 'VS') && s.media >= t.config.mediaVS) {
       if (s.mf == null) return { cod: 'VS', texto: 'Precisa de VS' };
       return s.mf >= min ? { cod: 'OK', texto: 'Aprovado na VS' } : { cod: 'BAIXA', texto: 'Reprovado na VS' };
     }
@@ -961,14 +1262,28 @@
     7: 'Convênio cultural', 8: 'Reingresso', 9: 'Mandado judicial', 0: 'Rematrícula'
   };
 
+  /** cursos = null: instituição em que a matrícula não segue a regra da UFF. */
   function infoMatricula(mat, cursos) {
+    if (cursos === null) return null;
+    const pos = matriculaPos(mat);
+    if (pos) {
+      const d = pos.replace(/\./g, '');
+      const ano = 2000 + +d.slice(5, 7), sem = +d[4];
+      return {
+        nivel: 'pos', vinculo: d[0], cod: d.slice(1, 4), ano, semestre: sem, curso: VINCULOS[d[0]], cursoConhecido: true,
+        ingresso: ano + '/' + sem + ' · programa ' + d.slice(1, 4)
+      };
+    }
+    if (provisoria(mat)) {
+      return { nivel: 'pos', vinculo: '', cod: '', curso: 'Pós-graduação', cursoConhecido: true, ingresso: 'matrícula provisória (CPF)' };
+    }
     if (!/^\d{9}$/.test(mat || '')) return null;
     const forma = +mat[0];
     const ano = 2000 + +mat.slice(1, 3);
     const cod = mat.slice(3, 6);
     const nomeCurso = (cursos || {})[cod];
     return {
-      forma, ano, cod,
+      nivel: 'grad', vinculo: 'G', forma, ano, cod,
       semestre: forma === 1 ? 1 : forma === 2 ? 2 : null,
       formaTexto: FORMAS_INGRESSO[forma],
       curso: nomeCurso || 'curso ' + cod,
@@ -977,12 +1292,98 @@
     };
   }
 
+  /** Vínculo do aluno: o escolhido à mão ou o que a matrícula indica (G, M, D, A; '' = não se sabe). */
+  function vinculoAluno(t, a) {
+    if (a.vinculo) return a.vinculo;
+    const i = ehUFF(t) ? infoMatricula(a.matricula, {}) : null;
+    return i ? i.vinculo : '';
+  }
+
+  /** 'pos' ou 'grad': decide as regras de nota (a pós não tem VS e pode ter outra média mínima). */
+  function nivelAluno(t, a) {
+    const v = vinculoAluno(t, a);
+    if (v) return NIVEL_VINCULO[v] || 'grad';
+    const i = ehUFF(t) ? infoMatricula(a.matricula, {}) : null;
+    return i ? i.nivel : 'grad';
+  }
+
+  function mediaMinPos(t) {
+    return t.config.mediaMinPos == null ? t.config.mediaMin : t.config.mediaMinPos;
+  }
+
+  /** Curso (graduação) ou vínculo (pós) para mostrar; cursos = tabela de códigos, ou null fora da UFF. */
+  function cursoAluno(t, a, cursos) {
+    if (a.vinculo && a.vinculo !== 'G') return VINCULOS[a.vinculo];
+    const i = infoMatricula(a.matricula, cursos);
+    if (i) return i.curso;
+    return a.vinculo ? VINCULOS[a.vinculo] : '';
+  }
+
+  /** CPF do aluno (ou a matrícula provisória, que é o CPF). */
+  function cpfAluno(a) {
+    return a.cpf || (provisoria(a.matricula) ? a.matricula : '');
+  }
+
+  /** Mesma pessoa? CPF manda; sem CPF dos dois lados, matrícula, e-mail ou nome completo igual. */
+  function mesmaPessoa(a, b) {
+    const ca = cpfAluno(a), cb = cpfAluno(b);
+    if (ca && cb) return ca === cb;
+    if (a.matricula && b.matricula && a.matricula === b.matricula) return true;
+    if (a.email && b.email && a.email.toLowerCase() === b.email.toLowerCase()) return true;
+    return !!a.nome && norm(a.nome) === norm(b.nome) && norm(a.nome).split(' ').length >= 3;
+  }
+
+  /** A mesma pessoa nas outras turmas: [{ t, a }], do período mais antigo ao mais recente. */
+  function historicoAluno(turmas, t, a) {
+    const out = [];
+    turmas.forEach(u => {
+      if (u === t) return;
+      const b = u.alunos.find(x => mesmaPessoa(a, x));
+      if (b) out.push({ t: u, a: b });
+    });
+    return out.sort((x, y) => String(x.t.periodo).localeCompare(String(y.t.periodo)));
+  }
+
+  /** Todas as pessoas de todas as turmas, agrupadas (CPF primeiro). */
+  function pessoasDe(turmas) {
+    const grupos = [];
+    const porCpf = new Map(), porMat = new Map();
+    turmas.forEach(t => t.alunos.forEach(a => {
+      const cpf = cpfAluno(a);
+      let g = (cpf && porCpf.get(cpf)) || (a.matricula && porMat.get(a.matricula)) ||
+        (!cpf && grupos.find(x => x.itens.some(i => mesmaPessoa(a, i.a))));
+      if (!g) { g = { itens: [] }; grupos.push(g); }
+      g.itens.push({ t, a });
+      if (cpf) porCpf.set(cpf, g);
+      if (a.matricula) porMat.set(a.matricula, g);
+    }));
+    return grupos.map(g => {
+      const ult = g.itens.slice().sort((x, y) => String(y.t.periodo).localeCompare(String(x.t.periodo)))[0];
+      return { nome: ult.a.nome, cpf: g.itens.map(i => cpfAluno(i.a)).find(Boolean) || '',
+        matriculas: Array.from(new Set(g.itens.map(i => i.a.matricula).filter(m => m && !provisoria(m)))),
+        itens: g.itens.sort((x, y) => String(x.t.periodo).localeCompare(String(y.t.periodo))) };
+    }).sort((x, y) => norm(x.nome).localeCompare(norm(y.nome)));
+  }
+
+  /** Data no nome do arquivo (2024jul08, 2025-01-13, 20maio2019, 2021dez4) → 'AAAA-MM-DD'. */
+  function dataNoNome(nome) {
+    const M = { jan: 1, fev: 2, feb: 2, mar: 3, abr: 4, apr: 4, mai: 5, may: 5, jun: 6, jul: 7, ago: 8, aug: 8, set: 9, sep: 9, out: 10, oct: 10, nov: 11, dez: 12, dec: 12 };
+    const s = String(nome || '');
+    let m = s.match(/(20\d{2})[ab]?[-_]?(jan|fev|feb|mar|abr|apr|mai|may|jun|jul|ago|aug|set|sep|out|oct|nov|dez|dec)[a-zç]*[-_]?(\d{1,2})(?!\d)/i);
+    if (m) return m[1] + '-' + String(M[m[2].toLowerCase()]).padStart(2, '0') + '-' + m[3].padStart(2, '0');
+    m = s.match(/(20\d{2})-(\d{2})-(\d{2})/);
+    if (m) return m[0];
+    m = s.match(/(\d{1,2})(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[a-z]*(20\d{2})/i);
+    if (m) return m[3] + '-' + String(M[m[2].toLowerCase()]).padStart(2, '0') + '-' + m[1].padStart(2, '0');
+    return null;
+  }
+
   /** Códigos de curso presentes nas turmas: { '03': 40, ... } */
   function cursosEncontrados(turmas) {
     const n = {};
-    turmas.forEach(t => t.alunos.forEach(a => {
+    turmas.filter(ehUFF).forEach(t => t.alunos.forEach(a => {
       const i = infoMatricula(a.matricula);
-      if (i) n[i.cod] = (n[i.cod] || 0) + 1;
+      if (i && i.nivel === 'grad') n[i.cod] = (n[i.cod] || 0) + 1;
     }));
     return n;
   }
@@ -1070,7 +1471,7 @@
     const ativos = alunosOrdenados(t, false);
     switch (c.tipo) {
       case 'freq': return ativos.filter(comFreq);
-      case 'vs': return ativos.filter(a => comFreq(a) && mp(a) != null && mp(a) >= t.config.mediaVS && mp(a) < t.config.mediaMin);
+      case 'vs': return ativos.filter(a => nivelAluno(t, a) !== 'pos' && comFreq(a) && mp(a) != null && mp(a) >= t.config.mediaVS && mp(a) < t.config.mediaMin);
       case 'vr': {
         const feitas = avaliacoesMedia(t).filter(v => v.data && v.data <= hoje);
         return ativos.filter(a => comFreq(a) && feitas.some(v => notaDez(t, v, a) == null));
@@ -1095,8 +1496,7 @@
     const lim = limiteFaltas(t);
     const tipo = (ol.criterio && ol.criterio.tipo) || 'ativos';
     const linhas = alunosParaLista(t, ol.criterio).map(a => {
-      const i = infoMatricula(a.matricula, cursos);
-      const curso = i ? i.curso : '';
+      const curso = cursoAluno(t, a, cursos);
       return {
         matricula: a.matricula, nome: a.nome, curso: a.ativo ? curso : 'fora da lista' + (curso ? ' · ' + curso : ''),
         risca: reprovadoPorFalta(t, statsAluno(t, a).faltas)
@@ -1112,8 +1512,8 @@
     else if (tipo !== 'ativos') { const r = criteriosLista(t)[tipo]; criterio = r.charAt(0).toLowerCase() + r.slice(1); }
     return {
       titulo: 'Lista de presença' + (ol.titulo ? ' — ' + ol.titulo : ''),
-      disciplina: t.disciplina,
-      info: [t.codigo && 'Código: ' + t.codigo, t.turma && 'Turma: ' + t.turma, t.periodo && 'Período: ' + periodoCurto(t.periodo)].filter(Boolean).join('     ·     '),
+      disciplina: disciplinaTema(t),
+      info: [t.instituicao, t.codigo && 'Código: ' + t.codigo, t.turma && 'Turma: ' + t.turma, t.periodo && 'Período: ' + periodoCurto(t.periodo)].filter(Boolean).join('     ·     '),
       data: ol.data ? fmtDate(ol.data) : '',
       linhas, n, riscados,
       nota: (tipo === 'ativos' ? n + ' inscritos' : n + ' aluno(s)' + (criterio ? ' — ' + criterio : '')) +
@@ -1133,7 +1533,7 @@
     const pesoTxt = String(peso);
     const limite = limiteFaltas(t);
     const situacaoTxt = a => a.ativo ? 'inscrito' : 'fora da lista' + (a.saiuEm ? ' (' + (a.saiuEm.includes('-') ? fmtDate(a.saiuEm) : a.saiuEm) + ')' : '');
-    const cursoDe = a => { const i = infoMatricula(a.matricula, cursos); return i ? i.curso : ''; };
+    const cursoDe = a => cursoAluno(t, a, cursos);
     const put = (ws, r, c, cell) => { ws[U.encode_cell({ r, c })] = cell; };
     const s = (v, st) => ({ t: 's', v: String(v == null ? '' : v), s: st });
     const n = (v, st, extra) => Object.assign({ t: 'n', v, s: st }, extra);
@@ -1288,6 +1688,7 @@
       });
       const fMP = U.encode_cell({ r, c: cMP });
       const fMF = vs ? U.encode_cell({ r, c: cMF }) : fMP;
+      const pos = st.nivel === 'pos', minA = pos ? mediaMinPos(t) : minM;
       if (usaveis.length) {
         const VR = vr && colDe[vr.id];
         const termos = usaveis.map((v, j) => {
@@ -1309,8 +1710,9 @@
           put(nt, r, cMF, st.mf == null
             ? s('', corpo(i, inativo, { font: { bold: true }, alignment: { horizontal: 'center' } }))
             : n(st.mf, corpo(i, inativo, { font: { bold: true }, alignment: { horizontal: 'center' }, numFmt: '0.0' }), { z: '0.0' }));
-          nt[fMF].f = 'IF(' + fMP + '="","",IF(OR(' + fMP + '>=' + minM + ',' + fMP + '<' + minVS + '),' + fMP +
-            ',IF(ISNUMBER(' + VS + R + '),ROUND(' + VS + R + '/' + VS + '$' + lMax + '*10,1),"")))';
+          nt[fMF].f = pos ? 'IF(' + fMP + '="","",' + fMP + ')'
+            : 'IF(' + fMP + '="","",IF(OR(' + fMP + '>=' + minM + ',' + fMP + '<' + minVS + '),' + fMP +
+              ',IF(ISNUMBER(' + VS + R + '),ROUND(' + VS + R + '/' + VS + '$' + lMax + '*10,1),"")))';
         }
       } else {
         put(nt, r, cMP, s('', corpo(i, inativo)));
@@ -1324,10 +1726,10 @@
       const fFal = U.encode_cell({ r, c: cFal });
       let fSit = '""';
       if (usaveis.length) {
-        const ramoVS = vs
+        const ramoVS = vs && !pos
           ? 'IF(' + fMP + '>=' + minVS + ',IF(ISNUMBER(' + colDe[vs.id] + R + '),IF(' + fMF + '>=' + minM + ',"Aprovado na VS","Reprovado na VS"),"Precisa de VS"),"Abaixo da média")'
           : '"Abaixo da média"';
-        fSit = 'IF(' + fMP + '="","",IF(' + fMP + '>=' + minM + ',"Média suficiente",' + ramoVS + '))';
+        fSit = 'IF(' + fMP + '="","",IF(' + fMP + '>=' + minA + ',"Média suficiente",' + ramoVS + '))';
       }
       put(nt, r, cSit, {
         t: 's', v: sitNota.texto,
@@ -1378,7 +1780,9 @@
     // ---- Cronograma
     const cr = {};
     put(cr, 0, 0, s(titulo, ST.titulo()));
-    ['Data', 'Dia', 'Tipo', 'Conteúdo', 'P', 'A', 'J', 'F'].forEach((h, c) => put(cr, 2, c, s(h, c === 3 ? ST.cabEsq() : ST.cab())));
+    const comCategoria = t.aulas.some(a => a.categoria);
+    ['Data', 'Dia', 'Tipo', 'Conteúdo', 'P', 'A', 'J', 'F'].concat(comCategoria ? ['Tipo de aula'] : [])
+      .forEach((h, c) => put(cr, 2, c, s(h, c === 3 ? ST.cabEsq() : ST.cab())));
     const todasAulas = aulasOrdenadas(t);
     todasAulas.forEach((aula, i) => {
       const r = 3 + i;
@@ -1393,14 +1797,15 @@
       put(cr, r, 1, s(DIAS[weekday(aula.data)], corpo(i, false, ex(centro))));
       put(cr, r, 2, s(TIPOS[aula.tipo] || aula.tipo, corpo(i, false, ex(centro))));
       put(cr, r, 3, s(aula.conteudo || '', corpo(i, false, ex({ alignment: { wrapText: true } }))));
+      if (comCategoria) put(cr, r, 8, s(aula.categoria || '', corpo(i, false, ex(centro))));
       ['P', 'A', 'J', 'F'].forEach((k, j) => {
         put(cr, r, 4 + j, feita
           ? n(c[k], corpo(i, false, { font: { bold: true, color: { rgb: COR[k][1] } }, alignment: { horizontal: 'center' } }))
           : s('', corpo(i, false, ex())));
       });
     });
-    cr['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: 2 + Math.max(todasAulas.length, 1), c: 7 } });
-    cr['!cols'] = [{ wch: 12 }, { wch: 6 }, { wch: 11 }, { wch: 50 }, { wch: 5 }, { wch: 5 }, { wch: 5 }, { wch: 5 }];
+    cr['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: 2 + Math.max(todasAulas.length, 1), c: comCategoria ? 8 : 7 } });
+    cr['!cols'] = [{ wch: 12 }, { wch: 6 }, { wch: 11 }, { wch: 50 }, { wch: 5 }, { wch: 5 }, { wch: 5 }, { wch: 5 }, { wch: 16 }];
     cr['!rows'] = [{ hpt: 24 }];
     U.book_append_sheet(wb, cr, 'Cronograma');
 
@@ -1411,7 +1816,7 @@
       .forEach((h, c) => put(al, 2, c, s(h, c === 2 || c === 3 || c === 5 ? ST.cabEsq() : ST.cab())));
     alunos.forEach((a, i) => {
       const info = infoMatricula(a.matricula, cursos);
-      [a.matricula, a.cpf || '', a.nome, a.email || '', info ? info.curso : '', info ? info.ingresso : '', situacaoTxt(a),
+      [a.matricula, a.cpf || '', a.nome, a.email || '', cursoDe(a), info ? info.ingresso : '', situacaoTxt(a),
         { lista: 'lista oficial', manual: 'incluído à mão', planilha: 'planilha antiga' }[a.origem] || a.origem]
         .forEach((v, c) => put(al, 3 + i, c, s(v, corpo(i, !a.ativo, c === 2 || c === 3 || c === 5 ? {} : centro))));
     });
@@ -1451,20 +1856,48 @@
     // ---- Configuração
     const cfg = {};
     put(cfg, 0, 0, s(titulo, ST.titulo()));
-    const itens = [['Aulas previstas', aulasPrevistas(t)],
-      ['Frequência mínima (%)', t.config.freqMin],
+    const tiposDia = Object.keys(t.config.categoriaDia || {}).sort()
+      .map(d => DIAS[d] + ': ' + t.config.categoriaDia[d]).join(' · ');
+    const dataCfg = iso => iso ? { data: iso } : '—';
+    // Rótulos lidos de volta por parseConfiguracao ao importar a planilha (não mudar sem mudar lá).
+    const itens = [['Identificação', null],
+      ['Instituição', t.instituicao || '—'],
+      ['Disciplina', t.disciplina || '—'],
+      ['Código', t.codigo || '—'],
+      ['Turma', t.turma || '—'],
+      ['Período', t.periodo || '—'],
+      ['Tema', t.tema || '—'],
+      ['Nome curto', t.nomeCurto || '—'],
+      ['Aulas', null],
       ['Carga horária (h)', t.config.cargaHoraria || '—'],
       ['Horas por aula', t.config.horasAula || '—'],
-      ['Máximo de faltas (reprova acima disso)', limite],
+      ['Dias de aula', (t.config.dias || []).map(d => DIAS[d]).join(', ') || '—'],
+      ['Início das aulas', dataCfg(t.config.inicio)],
+      ['Fim das aulas', dataCfg(t.config.fim)],
+      ['Tipos de aula', (t.config.categorias || []).join(', ') || '—'],
+      ['Tipo de aula por dia', tiposDia || '—'],
+      ['Frequência e notas', null],
+      ['Frequência mínima (%)', t.config.freqMin],
       ['Peso do atraso (em faltas)', peso],
       ['Média mínima', t.config.mediaMin],
-      ['Lista oficial atualizada em', t.listaEm ? fmtDate(t.listaEm) : '—'],
-      ['Exportado em', fmtDate(todayISO())]];
+      ['Média para fazer VS (a partir de)', t.config.mediaVS],
+      ['Média mínima na pós (sem VS)', mediaMinPos(t)],
+      ['Calculado (só informação)', null],
+      ['Aulas previstas', aulasPrevistas(t)],
+      ['Máximo de faltas (reprova acima disso)', limite],
+      ['Lista oficial atualizada em', t.listaEm ? dataCfg(t.listaEm) : '—'],
+      ['Exportado em', dataCfg(todayISO())]];
     itens.forEach(([k, v], i) => {
+      if (v === null) {   // título de grupo
+        put(cfg, 2 + i, 0, s(k, estilo({ font: { bold: true, color: { rgb: COR.texto } } })));
+        return;
+      }
       put(cfg, 2 + i, 0, s(k, estilo({ font: { bold: true, color: { rgb: COR.cinza } }, fill: COR.claro })));
-      put(cfg, 2 + i, 1, typeof v === 'number' ? n(v, estilo({ alignment: { horizontal: 'left' } })) : s(v, estilo()));
+      if (v && v.data) put(cfg, 2 + i, 1, n(isoToSerial(v.data), estilo({ numFmt: 'dd/mm/yyyy', alignment: { horizontal: 'left' } }), { z: 'dd/mm/yyyy' }));
+      else put(cfg, 2 + i, 1, typeof v === 'number' ? n(v, estilo({ alignment: { horizontal: 'left' } })) : s(v, estilo()));
     });
-    cfg['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: 1 + itens.length, c: 1 } });
+    put(cfg, 3 + itens.length, 0, s('Ao importar esta planilha numa turma nova, o app lê estes valores (menos os calculados).', ST.subtitulo()));
+    cfg['!ref'] = U.encode_range({ s: { r: 0, c: 0 }, e: { r: 3 + itens.length, c: 1 } });
     cfg['!cols'] = [{ wch: 38 }, { wch: 40 }];
     cfg['!rows'] = [{ hpt: 24 }];
     U.book_append_sheet(wb, cfg, 'Configuração');
@@ -1499,7 +1932,7 @@
   /** Nome curto da turma (para arquivos): o que o professor definiu ou sigla + período, ex. "LFTC 2026-2". */
   function nomeCurto(t) {
     if (t.nomeCurto) return t.nomeCurto;
-    return [siglaDisciplina(t.disciplina) || t.codigo || 'Turma', periodoCurto(t.periodo)].filter(Boolean).join(' ');
+    return [siglaDisciplina(t.tema || t.disciplina) || t.codigo || 'Turma', periodoCurto(t.periodo)].filter(Boolean).join(' ');
   }
 
   /** Nome de arquivo legível: "LFTC 2026-2 - planilha.xlsx", "Chamada - backup 2026-10-12.json". */
@@ -1511,12 +1944,12 @@
   g.CC = {
     STATUS, STATUS_LABEL, TIPOS, TIPOS_AVALIACAO, DIAS, DEFAULT_CONFIG,
     uid, norm, titleCase, todayISO, addDays, weekday, fmtDate, cellToISO, numBR,
-    parseWorkbook, novaTurma, nomeTurma, alunosOrdenados, aulasOrdenadas, findAluno,
+    parseWorkbook, novaTurma, nomeTurma, disciplinaTema, turmaDePlanilha, corrigirMatriculasAntigas, cpfAluno, mesmaPessoa, historicoAluno, pessoasDe, dataNoNome, ehUFF, categoriaPadrao, aplicarCategorias, alunosOrdenados, aulasOrdenadas, findAluno,
     diffLista, aplicarLista, importarDados, gerarCronograma, aulaDaData, removerAula, removerAluno,
     aulaRealizada, contarAula, aulasPrevistas, limiteFaltas, reprovadoPorFalta, statsAluno, mediaAluno, mediaFinal, tipoFromConteudo,
     avaliacoesMedia, avaliacaoTipo, sincronizarAvaliacoes, aplicarPlano, planoPadrao,
     levenshtein, casarTexto, digitosOCR,
     FILTROS, ORDENS, alunosVisao, situacaoNota, estatisticasNotas, CAMPOS_EMAIL, MODELOS_EMAIL, preencherModelo,
-    montarPlanilha, dadosListaPresenca, criteriosLista, alunosParaLista, nomeArquivo, nomeCurto, siglaDisciplina, periodoCurto, infoMatricula, cursosEncontrados, FORMAS_INGRESSO
+    montarPlanilha, dadosListaPresenca, criteriosLista, alunosParaLista, nomeArquivo, nomeCurto, siglaDisciplina, periodoCurto, infoMatricula, cursosEncontrados, FORMAS_INGRESSO, VINCULOS, vinculoAluno, nivelAluno, cursoAluno, mediaMinPos, matriculaPos, cpfValido
   };
 })(typeof window !== 'undefined' ? window : globalThis);

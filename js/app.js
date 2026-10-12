@@ -10,55 +10,103 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.4.0';
+  const VERSAO = '0.7.0';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
 
   /* ---------- armazenamento ---------- */
 
+  /* Os dados vão para o IndexedDB (cabe bem mais: dezenas de turmas antigas) e, enquanto couber, também
+   * para o localStorage, que é lido na hora ao abrir. Quando não cabe mais, fica só no IndexedDB. */
+  const KEY_IDB = KEY + '.so-idb';
+  let aguardandoIDB = false;
   let db = carregar();
   let salvarTimer = null;
+
+  function normalizarDb(dados) {
+    dados.turmas = dados.turmas || [];
+    dados.turmas.forEach(t => { t.config = Object.assign({}, CC.DEFAULT_CONFIG, t.config); delete t.config.totalAulas; });
+    return dados;
+  }
 
   function carregar() {
     try {
       const raw = localStorage.getItem(KEY);
-      if (raw) {
-        const dados = JSON.parse(raw);
-        dados.turmas.forEach(t => { t.config = Object.assign({}, CC.DEFAULT_CONFIG, t.config); delete t.config.totalAulas; });
-        return dados;
-      }
+      if (raw) return normalizarDb(JSON.parse(raw));
+      aguardandoIDB = !!localStorage.getItem(KEY_IDB);
     } catch (e) { console.error(e); }
     return { versao: 1, turmas: [] };
   }
 
-  function salvar() {
-    clearTimeout(salvarTimer);
-    salvarTimer = setTimeout(() => {
-      try { localStorage.setItem(KEY, JSON.stringify(db)); }
-      catch (e) { toast('Não consegui salvar no aparelho: ' + e.message); }
-    }, 150);
+  let idbPromessa = null;
+  function idb() {
+    if (!idbPromessa) {
+      idbPromessa = new Promise((ok, erro) => {
+        const r = indexedDB.open('classroomcontrol-dados', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('kv');
+        r.onsuccess = () => ok(r.result);
+        r.onerror = () => erro(r.error);
+      });
+    }
+    return idbPromessa;
+  }
+  async function idbGravar(json) {
+    const d = await idb();
+    return new Promise((ok, erro) => {
+      const tx = d.transaction('kv', 'readwrite');
+      tx.objectStore('kv').put(json, 'db');
+      tx.oncomplete = () => ok();
+      tx.onerror = () => erro(tx.error);
+    });
+  }
+  async function idbLer() {
+    const d = await idb();
+    return new Promise((ok, erro) => {
+      const r = d.transaction('kv').objectStore('kv').get('db');
+      r.onsuccess = () => ok(r.result || null);
+      r.onerror = () => erro(r.error);
+    });
   }
 
-  window.addEventListener('pagehide', () => {
-    try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* sem espaço */ }
-  });
+  function gravarAgora() {
+    if (aguardandoIDB) return;          // ainda não leu o IndexedDB: não sobrescrever com dados vazios
+    db.salvoEm = Date.now();
+    const json = JSON.stringify(db);
+    let local = true;
+    try { localStorage.setItem(KEY, json); localStorage.removeItem(KEY_IDB); }
+    catch (e) {
+      local = false;
+      try { localStorage.removeItem(KEY); localStorage.setItem(KEY_IDB, String(db.salvoEm)); } catch (e2) { /* nada */ }
+    }
+    if (window.indexedDB) idbGravar(json).catch(e => { if (!local) toast('Não consegui salvar no aparelho: ' + e.message); });
+    else if (!local) toast('Não consegui salvar no aparelho (sem espaço).');
+  }
+
+  function salvar() {
+    clearTimeout(salvarTimer);
+    salvarTimer = setTimeout(gravarAgora, 150);
+  }
+
+  window.addEventListener('pagehide', () => { clearTimeout(salvarTimer); gravarAgora(); });
 
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
 
   function turma(id) { return db.turmas.find(t => t.id === id); }
 
   /** Tabela código → curso: a editada pelo usuário ou, se não houver, a da UFF (cursos-uff.js). */
-  function cursos() { return db.cursos || window.CURSOS_UFF || {}; }
+  function cursos(t) {
+    if (t && !CC.ehUFF(t)) return null;   // outra instituição: a matrícula não diz o curso
+    return db.cursos || window.CURSOS_UFF || {};
+  }
 
   function limTxt(t) {
     const l = CC.limiteFaltas(t);
     return CC.numBR(l, l % 1 ? 1 : 0);
   }
 
-  function cursoDe(a) {
-    const i = CC.infoMatricula(a.matricula, cursos());
-    return i ? i.curso : '';
+  function cursoDe(t, a) {
+    return CC.cursoAluno(t, a, cursos(t));
   }
 
   /* ---------- utilitários de UI ---------- */
@@ -156,8 +204,84 @@
     return file.arrayBuffer().then(buf => {
       if (!window.XLSX) throw new Error('Biblioteca de planilhas não carregou (abra o app uma vez com internet).');
       const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
-      return CC.parseWorkbook(XLSX, wb);
+      const p = CC.parseWorkbook(XLSX, wb);
+      Object.defineProperty(p, 'wb', { value: wb });   // para escolher as colunas à mão, se preciso
+      return p;
     });
+  }
+
+  const letraCol = c => XLSX.utils.encode_col(c);
+
+  /**
+   * Importação assistida: a pessoa escolhe a aba, a linha dos títulos e as colunas de matrícula, nome,
+   * e-mail e CPF (datas e notas são lidas da linha dos títulos). Devolve a planilha lida ou null.
+   */
+  async function escolherColunas(wb, nomeArq) {
+    const matriz = aba => XLSX.utils.sheet_to_json(wb.Sheets[aba], { header: 1, raw: false, defval: '' });
+    const palpite = m => {
+      const linhas = m.slice(0, 60), ncol = Math.max(0, ...linhas.map(r => r.length));
+      const conta = re => Array.from({ length: ncol }, (_, c) => linhas.filter(r => re.test(String(r[c] || '').trim())).length);
+      const melhor = arr => { const mx = Math.max(0, ...arr); return mx >= 2 ? arr.indexOf(mx) : -1; };
+      const nome = melhor(conta(/^[A-Za-zÀ-ÿ]{2,}(\s+[A-Za-zÀ-ÿ.]{1,})+$/));
+      const mat = melhor(conta(/^([A-Za-z]?\d[\d.\-]{5,14}\d)$/));
+      const email = melhor(conta(/@/));
+      const prim = linhas.findIndex(r => nome >= 0 && /^[A-Za-zÀ-ÿ]{2,}\s+[A-Za-zÀ-ÿ]/.test(String(r[nome] || '')));
+      return { linha: prim > 0 ? prim : 0, mat, nome, email, cpf: -1 };
+    };
+    const opcoesCol = (m, sel) => {
+      const ncol = Math.max(1, ...m.slice(0, 30).map(r => r.length));
+      return '<option value="-1">—</option>' + Array.from({ length: ncol }, (_, c) => {
+        const ex = (m.slice(0, 30).map(r => String(r[c] || '').trim()).find(Boolean) || '').slice(0, 18);
+        return `<option value="${c}" ${c === sel ? 'selected' : ''}>${letraCol(c)}${ex ? ' · ' + esc(ex) : ''}</option>`;
+      }).join('');
+    };
+    const previa = m => '<table class="previa"><tbody>' + m.slice(0, 8).map((r, i) => `<tr><th>${i + 1}</th>` +
+      Array.from({ length: Math.min(10, Math.max(...m.slice(0, 8).map(x => x.length), 1)) }, (_, c) => `<td>${esc(String(r[c] || '').slice(0, 16))}</td>`).join('') + '</tr>').join('') + '</tbody></table>';
+    const opcoes = d => ({ aba: d.aba, cabecalho: { row: (parseInt(d.linha, 10) || 0) - 1, mat: +d.mat, nome: +d.nome, email: +d.email, cpf: +d.cpf } });
+    const aba0 = wb.SheetNames[0];
+    const r = await dialogo(`<h2>Escolher colunas</h2>
+      <p class="muted small">${esc(nomeArq)}: o app não reconheceu o cabeçalho. Diga onde estão os dados; datas e notas são lidas da linha dos títulos.</p>
+      <label class="field">Aba<select name="aba">${wb.SheetNames.map(n => `<option>${esc(n)}</option>`).join('')}</select></label>
+      <div class="previa-box" id="previa"></div>
+      <label class="field">Linha dos títulos (0 se não houver)<input type="number" name="linha" min="0" value="0"></label>
+      <div class="row" id="cols"></div>
+      <p class="small" id="conta-cols"></p>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Usar</button></div>`,
+    form => {
+      const aba = form.querySelector('[name=aba]');
+      const desenhar = (novaAba) => {
+        const m = matriz(aba.value);
+        if (novaAba) {
+          const g = palpite(m);
+          form.querySelector('[name=linha]').value = g.linha;
+          form.querySelector('#cols').innerHTML = [['mat', 'Matrícula', g.mat], ['nome', 'Nome', g.nome], ['email', 'E-mail', g.email], ['cpf', 'CPF', g.cpf]]
+            .map(([k, rot, sel]) => `<label class="field grow">${rot}<select name="${k}">${opcoesCol(m, sel)}</select></label>`).join('');
+          form.querySelector('#previa').innerHTML = previa(m);
+        }
+        const dados = {}; new FormData(form).forEach((v, k) => { dados[k] = v; });
+        let p = null;
+        try { if (+dados.nome >= 0 || +dados.mat >= 0) p = CC.parseWorkbook(XLSX, wb, opcoes(dados)); } catch (e) { /* combinação inválida */ }
+        form.querySelector('#conta-cols').textContent = p ? `${p.alunos.length} aluno(s), ${p.datas.length} data(s) de chamada, ${p.notas.length} coluna(s) de notas.` : 'Escolha ao menos a coluna do nome ou da matrícula.';
+      };
+      aba.addEventListener('change', () => desenhar(true));
+      form.addEventListener('change', e => { if (e.target !== aba) desenhar(false); });
+      form.addEventListener('input', e => { if (e.target.name === 'linha') desenhar(false); });
+      aba.value = aba0; desenhar(true);
+    });
+    if (r.acao !== 'ok') return null;
+    const p = CC.parseWorkbook(XLSX, wb, opcoes(r.dados));
+    Object.defineProperty(p, 'wb', { value: wb });
+    if (!p.alunos.length) { toast('Nenhum aluno com essas colunas.'); return null; }
+    return p;
+  }
+
+  /** Lê a planilha; se não achar alunos, oferece escolher as colunas à mão. */
+  async function lerComAjuda(file) {
+    let p;
+    try { p = await lerPlanilha(file); } catch (e) { toast('Erro ao ler: ' + e.message); return null; }
+    if (p.alunos.length) return p;
+    const ok = await confirmar('Lista não reconhecida', `${esc(p.avisos[0] || 'Não encontrei alunos nessa planilha.')} Quer indicar as colunas à mão?`, 'Escolher colunas');
+    return ok ? escolherColunas(p.wb, file.name) : null;
   }
 
   /** Entrega um arquivo gerado: na pasta de trabalho, "salvar como", compartilhar ou baixar. */
@@ -239,6 +363,7 @@
   function render() {
     const partes = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     window.scrollTo(0, 0);
+    if (partes[0] === 'pessoas') return telaPessoas(decodeURIComponent(partes[1] || ''));
     if (partes[0] !== 't') return telaTurmas();
     const t = turma(partes[1]);
     if (!t) return go('#/');
@@ -246,8 +371,30 @@
     const arg = partes[3];
     setTabs(t, tela === 'aluno' ? 'alunos' : tela);
     setTopo(t.codigo ? (t.codigo + (t.turma ? ' ' + t.turma : '')) : t.disciplina,
-      (t.codigo ? t.disciplina : t.periodo) + (t.arquivada ? ' · arquivada' : ''), '#/', () => menuTurma(t));
+      (t.codigo ? CC.disciplinaTema(t) : t.periodo) + (t.arquivada ? ' · arquivada' : ''), '#/', () => menuTurma(t));
     ({ chamada: telaChamada, alunos: telaAlunos, aluno: telaAluno, cronograma: telaCronograma, notas: telaNotas, resumo: telaResumo }[tela] || telaChamada)(t, arg);
+  }
+
+  /* ---------- tela: alunos de todas as turmas (pessoas, pelo CPF) ---------- */
+
+  function telaPessoas(busca) {
+    setTabs(null);
+    setTopo('Alunos', 'De todas as turmas', '#/', menuGeral);
+    const todas = CC.pessoasDe(db.turmas);
+    app.innerHTML = `<div class="card"><input type="search" id="busca-pessoa" placeholder="Nome, matrícula, CPF ou e-mail" value="${esc(busca)}" style="width:100%">
+      <p class="muted small" id="conta-pessoas"></p></div><div id="lista-pessoas"></div>`;
+    const desenhar = () => {
+      const q = CC.norm($('#busca-pessoa').value);
+      const lista = !q ? todas : todas.filter(g => CC.norm(g.nome).includes(q) || g.cpf.includes(q) || g.matriculas.some(m => m.includes(q)) ||
+        g.itens.some(i => (i.a.email || '').toUpperCase().includes(q)));
+      $('#conta-pessoas').textContent = `${lista.length} de ${todas.length} pessoa(s) · ${todas.filter(g => g.cpf).length} com CPF · ${todas.filter(g => g.itens.length > 1).length} em mais de uma turma`;
+      $('#lista-pessoas').innerHTML = lista.slice(0, 200).map(g => `<div class="card pessoa"><b>${esc(nomeCurto(g.nome))}</b>
+        <span class="muted small">${g.cpf ? 'CPF ' + esc(g.cpf.slice(0, 3)) + '.***.***-' + esc(g.cpf.slice(9)) : 'sem CPF'}${g.matriculas.length ? ' · ' + esc(g.matriculas.join(', ')) : ''}</span>
+        <div class="chips">${g.itens.map(({ t, a }) => `<a class="tag" href="#/t/${t.id}/aluno/${a.id}">${esc(CC.periodoCurto(t.periodo) || '?')} ${esc(CC.siglaDisciplina(t.tema || t.disciplina) || t.codigo)}${a.ativo ? '' : ' (saiu)'}</a>`).join(' ')}</div></div>`).join('') +
+        (lista.length > 200 ? `<p class="muted small" style="text-align:center">Mostrando 200; refine a busca.</p>` : '');
+    };
+    $('#busca-pessoa').addEventListener('input', desenhar);
+    desenhar();
   }
 
   /* ---------- tela: turmas ---------- */
@@ -255,6 +402,7 @@
   function telaTurmas() {
     setTabs(null);
     setTopo('Chamada', 'Suas turmas', null, menuGeral);
+    if (aguardandoIDB) { app.innerHTML = '<div class="card empty">Carregando…</div>'; return; }
     if (!db.turmas.length) {
       app.innerHTML = `<div class="card empty">
         <p><strong>Nenhuma turma ainda.</strong></p>
@@ -268,7 +416,7 @@
         const dadas = t.aulas.filter(a => CC.aulaRealizada(t, a)).length;
         return `<a class="card turma-card ${t.arquivada ? 'arquivada' : ''}" href="#/t/${t.id}/chamada">
           <div><span class="codigo">${esc([t.codigo, t.turma].filter(Boolean).join(' '))}</span> <span class="muted">${esc(t.periodo)}</span></div>
-          <h2>${esc(t.disciplina)}</h2>
+          <h2>${esc(CC.disciplinaTema(t))}</h2>
           <div class="muted small">${ativos} alunos · ${dadas} de ${CC.aulasPrevistas(t)} aulas com chamada${t.arquivada ? ' · arquivada em ' + CC.fmtDate(t.arquivada) : ''}</div></a>`;
       };
       const ativas = db.turmas.filter(t => !t.arquivada), arquivadas = db.turmas.filter(t => t.arquivada);
@@ -286,6 +434,8 @@
     dialogo(`<h2>Menu</h2><ul class="menu-list">
       <li><button value="importar">Importar planilha (nova turma)</button></li>
       <li><button value="vazia">Criar turma vazia</button></li>
+      <li><button value="varias">Importar várias planilhas (turmas antigas)</button></li>
+      <li><button value="pessoas">Alunos de todas as turmas</button></li>
       <li class="sep"></li>
       ${Pasta.suportada ? '<li><button value="pasta">Pasta de trabalho</button></li>' : ''}
       <li><button value="cursos">Códigos de curso</button></li>
@@ -298,6 +448,8 @@
       if (r.acao === 'pasta') configurarPasta(null);
       if (r.acao === 'importar') importarNovaTurma();
       if (r.acao === 'vazia') criarTurmaVazia();
+      if (r.acao === 'varias') importarVarias();
+      if (r.acao === 'pessoas') go('#/pessoas');
       if (r.acao === 'backup') salvarBackup();
       if (r.acao === 'restaurar') restaurarBackup();
       if (r.acao === 'sobre') sobre();
@@ -312,17 +464,29 @@
       <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
   }
 
+  /** Cria a turma com os dados do diálogo; a instituição vira o padrão das próximas. */
+  function novaTurmaDe(d) {
+    const t = CC.novaTurma(Object.assign({}, d, { instituicao: String(d.instituicao || '').trim() }));
+    if (t.instituicao) db.instituicao = t.instituicao;
+    const tema = String(d.tema || '').trim();
+    if (tema) t.tema = tema;
+    return t;
+  }
+
   async function criarTurmaVazia() {
     const r = await dialogo(`<h2>Nova turma</h2><div class="stack">
       <label class="field">Disciplina<input type="text" name="disciplina" required autofocus></label>
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo"></label>
       <label class="field grow">Turma<input type="text" name="turma"></label></div>
       <label class="field">Período<input type="text" name="periodo" placeholder="ex.: 20262"></label>
+      ${campoInstituicao(db.instituicao || 'UFF')}
+      ${campoTema('')}
       ${camposPeriodo(CC.DEFAULT_CONFIG, true)}
       ${camposPlano(CC.planoPadrao(2, true, true))}</div>
-      <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Criar</button></div>`, ligarPlano);
+      <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Criar</button></div>`,
+      form => { ligarPlano(form); ligarPeriodo(form); });
     if (r.acao !== 'ok') return;
-    const t = CC.novaTurma(r.dados);
+    const t = novaTurmaDe(r.dados);
     aplicarPeriodo(t, lerPeriodo(r.dados), !!r.dados.gerar);
     CC.aplicarPlano(t, lerPlano(r.dados));
     db.turmas.push(t); salvar();
@@ -332,9 +496,8 @@
   async function importarNovaTurma() {
     const file = await escolherArquivo('.xls,.xlsx,.ods,.csv');
     if (!file) return;
-    let p;
-    try { p = await lerPlanilha(file); } catch (e) { return toast('Erro ao ler: ' + e.message); }
-    if (!p.alunos.length) return toast(p.avisos[0] || 'Não encontrei alunos nessa planilha.');
+    const p = await lerComAjuda(file);
+    if (!p) return;
 
     const existente = db.turmas.find(t => p.meta.codigo && t.codigo === p.meta.codigo && t.turma === p.meta.turma && t.periodo === p.meta.periodo);
     if (existente) {
@@ -343,33 +506,42 @@
       return;
     }
 
-    const temDados = p.datas.length || p.cronograma.length || p.notas.length;
+    const temDados = p.datas.length || p.cronograma.length || p.notas.length || p.notasApp;
     const datasPlanilha = p.datas.concat(p.cronograma.map(c => c.data)).sort();
+    const cfgPlanilha = p.configuracao ? p.configuracao.config : {};
     const sugestao = Object.assign({}, CC.DEFAULT_CONFIG, {
       dias: diasFrequentes(datasPlanilha),
       inicio: datasPlanilha[0] || '',
       fim: p.cronograma.length ? p.cronograma.map(c => c.data).sort().pop() : ''
-    });
+    }, cfgPlanilha);
     const notasSugeridas = p.notas.filter(n => n.sugerida && !/^(VR|VS)$/.test(CC.norm(n.nome)));
-    const planoSugerido = notasSugeridas.length
-      ? notasSugeridas.map(n => ({ nome: n.nome, tipo: 'normal', data: '', peso: 1, max: n.max })).concat(CC.planoPadrao(0, true, true))
-      : CC.planoPadrao(2, true, true);
+    const planoSugerido = p.notasApp ? p.notasApp.plano
+      : notasSugeridas.length
+        ? notasSugeridas.map(n => ({ nome: n.nome, tipo: 'normal', data: '', peso: 1, max: n.max })).concat(CC.planoPadrao(0, true, true))
+        : CC.planoPadrao(2, true, true);
     const r = await dialogo(`<h2>Nova turma</h2>
       <div class="stack">
       <label class="field">Disciplina<input type="text" name="disciplina" value="${esc(p.meta.disciplina)}"></label>
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(p.meta.codigo)}"></label>
       <label class="field grow">Turma<input type="text" name="turma" value="${esc(p.meta.turma)}"></label>
       <label class="field grow">Período<input type="text" name="periodo" value="${esc(p.meta.periodo)}"></label></div>
-      <p class="muted">${p.alunos.length} alunos encontrados em <i>${esc(file.name)}</i>.</p>
-      ${temDados ? opcoesImportacao(p) : ''}
+      ${campoInstituicao((p.configuracao && p.configuracao.instituicao) || db.instituicao || 'UFF')}
+      ${campoTema((p.configuracao && p.configuracao.tema) || '')}
+      <p class="muted">${p.alunos.length} alunos encontrados em <i>${esc(file.name)}</i>.${p.configuracao ? ' Configuração da turma lida da aba "Configuração".' : ''}</p>
+      ${temDados ? opcoesImportacao(p, null) : ''}
       ${p.avisos.length ? `<details class="muted small"><summary>${p.avisos.length} aviso(s)</summary><ul>${p.avisos.map(a => '<li>' + esc(a) + '</li>').join('')}</ul></details>` : ''}
       ${camposPeriodo(sugestao, !p.cronograma.length && !!sugestao.fim)}
       ${camposPlano(planoSugerido)}
       </div>
-      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Criar turma</button></div>`, ligarPlano);
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Criar turma</button></div>`,
+      form => { ligarPlano(form); ligarPeriodo(form); });
     if (r.acao !== 'ok') return;
-    const t = CC.novaTurma(r.dados);
-    const opts = lerOpcoes(r.dados, p);
+    const t = novaTurmaDe(r.dados);
+    const opts = lerOpcoes(r.dados, p, null);
+    // Configuração da planilha (frequência, médias, nome curto); o resto vem dos campos do diálogo.
+    ['freqMin', 'pesoAtraso', 'mediaMin', 'mediaVS', 'mediaMinPos'].forEach(k => { if (cfgPlanilha[k] != null) t.config[k] = cfgPlanilha[k]; });
+    if (p.configuracao && p.configuracao.nomeCurto) t.nomeCurto = p.configuracao.nomeCurto;
+    Object.assign(t.config, lerPeriodo(r.dados));   // tipos de aula valem já para o cronograma importado
     // O plano vem antes da importação: as notas da planilha entram nas avaliações de mesmo nome.
     CC.aplicarPlano(t, lerPlano(r.dados));
     // Planilha só com a lista (sem chamada): vale como lista oficial.
@@ -381,8 +553,9 @@
     go('#/t/' + t.id + '/chamada');
   }
 
-  function opcoesImportacao(p) {
+  function opcoesImportacao(p, t) {
     let h = '<div class="checks">';
+    if (p.notasApp) h += `<label><input type="checkbox" name="notasApp" checked> plano de avaliação e notas da aba Notas (${p.notasApp.plano.map(v => esc(v.nome)).join(', ')})</label>`;
     if (p.datas.length) h += `<label><input type="checkbox" name="chamada" checked> chamada (${p.datas.length} datas)</label>`;
     if (p.cronograma.length) h += `<label><input type="checkbox" name="cronograma" checked> cronograma (${p.cronograma.length} datas)</label>`;
     h += '</div>';
@@ -390,13 +563,23 @@
       h += '<p class="muted small" style="margin:10px 0 4px">Colunas que parecem notas:</p><div class="checks">' +
         p.notas.map(n => `<label><input type="checkbox" name="nota" value="${n.col}" ${n.sugerida ? 'checked' : ''}> ${esc(n.nome)}</label>`).join('') + '</div>';
     }
+    // Planilha com alunos que não estão nesta turma (ex.: controle de duas turmas juntas)
+    if (t && t.listaEm) {
+      const fora = p.alunos.filter(d => !CC.findAluno(t, d, true)).length;
+      if (fora) {
+        const muitos = fora > p.alunos.length * 0.2;
+        h += `<div class="checks" style="margin-top:8px"><label><input type="checkbox" name="alunosFora" ${muitos ? '' : 'checked'}> incluir ${fora} aluno(s) da planilha que não estão nesta turma (como "fora da lista")</label></div>
+          ${muitos ? '<p class="muted small">A planilha parece ter alunos de outras turmas: desmarcado, só entram as marcações e notas de quem é desta turma.</p>' : ''}`;
+      }
+    }
     return h;
   }
 
-  function lerOpcoes(dados, p) {
+  function lerOpcoes(dados, p, t) {
     const sel = [].concat(dados.nota || []).map(Number);
     return {
-      alunos: true,
+      alunos: !(t && t.listaEm) || !!dados.alunosFora || !p.alunos.some(d => !CC.findAluno(t, d, true)),
+      notasApp: !!dados.notasApp,
       chamada: !!dados.chamada,
       cronograma: !!dados.cronograma,
       notas: p.notas.filter(n => sel.includes(n.col))
@@ -406,6 +589,19 @@
   /* ---------- componentes de formulário: período e plano de avaliação ---------- */
 
   /** Carga horária, dias da semana e período (início/fim) — para criar e configurar turmas. */
+  /** Tema da turma, para disciplinas de código genérico ("Tópicos especiais em …"). */
+  function campoTema(valor) {
+    return `<label class="field">Tema (opcional, para "Tópicos especiais…")<input type="text" name="tema" value="${esc(valor)}" placeholder="ex.: Criptografia"></label>`;
+  }
+
+  /** Campo "Instituição", com as já usadas como sugestão. */
+  function campoInstituicao(valor) {
+    const usadas = Array.from(new Set(['UFF'].concat(db.turmas.map(t => t.instituicao).filter(Boolean))));
+    return `<label class="field">Instituição<input type="text" name="instituicao" list="instituicoes" value="${esc(valor)}" placeholder="ex.: UFF"></label>
+      <datalist id="instituicoes">${usadas.map(i => `<option value="${esc(i)}">`).join('')}</datalist>
+      <p class="muted small" style="margin-top:-6px">Na UFF, o curso e a forma de ingresso saem da matrícula.</p>`;
+  }
+
   function camposPeriodo(c, gerarMarcado) {
     const dias = c.dias || [];
     return `<fieldset class="grupo"><legend>Carga horária e aulas</legend><div class="stack">
@@ -415,6 +611,8 @@
       <datalist id="cargas"><option value="60"><option value="64"><option value="68"></datalist>
       <div><div class="muted small">Dias de aula (opcional)</div>
       <div class="checks">${[1, 2, 3, 4, 5, 6].map(d => `<label><input type="checkbox" name="dia" value="${d}" ${dias.includes(d) ? 'checked' : ''}> ${CC.DIAS[d]}</label>`).join('')}</div></div>
+      <label class="field">Tipos de aula (opcional, separados por vírgula)<input type="text" name="categorias" value="${esc((c.categorias || []).join(', '))}" placeholder="ex.: Teórica, Laboratório"></label>
+      <div class="row" id="cat-dias" data-inicial="${esc(JSON.stringify(c.categoriaDia || {}))}"></div>
       <div class="row nowrap"><label class="field grow">Início das aulas<input type="date" name="inicio" value="${c.inicio || ''}"></label>
       <label class="field grow">Fim<input type="date" name="fim" value="${c.fim || ''}"></label></div>
       <label class="checks"><label><input type="checkbox" name="gerar" ${gerarMarcado ? 'checked' : ''}> gerar no cronograma as aulas que faltam</label></label>
@@ -422,17 +620,42 @@
       </div></fieldset>`;
   }
 
+  const lerCategorias = txt => Array.from(new Set(String(txt || '').split(/[,;]/).map(x => x.trim()).filter(Boolean)));
+
   function lerPeriodo(d) {
     const num = v => { const x = parseFloat(String(v == null ? '' : v).replace(',', '.')); return isNaN(x) ? 0 : x; };
+    const dias = [].concat(d.dia || []).map(Number);
+    const categorias = lerCategorias(d.categorias);
+    const categoriaDia = {};
+    dias.forEach(dia => { const c = d['cat' + dia]; if (c && categorias.includes(c)) categoriaDia[dia] = c; });
     return {
       cargaHoraria: num(d.cargaHoraria), horasAula: num(d.horasAula),
-      dias: [].concat(d.dia || []).map(Number), inicio: d.inicio || '', fim: d.fim || ''
+      dias, inicio: d.inicio || '', fim: d.fim || '', categorias, categoriaDia
     };
+  }
+
+  /** Um seletor de tipo de aula para cada dia marcado (refeito quando mudam os dias ou os tipos). */
+  function ligarPeriodo(form) {
+    const box = form.querySelector('#cat-dias');
+    if (!box) return;
+    let escolhas = {};
+    try { escolhas = JSON.parse(box.dataset.inicial || '{}'); } catch (e) { /* vazio */ }
+    const desenhar = () => {
+      box.querySelectorAll('select').forEach(s => { escolhas[s.dataset.dia] = s.value; });
+      const cats = lerCategorias(form.querySelector('[name=categorias]').value);
+      const dias = [...form.querySelectorAll('[name=dia]:checked')].map(i => +i.value);
+      box.innerHTML = cats.length && dias.length ? dias.map(d => `<label class="field grow">${CC.DIAS[d]}<select name="cat${d}" data-dia="${d}">
+        <option value="">—</option>${cats.map(c => `<option ${escolhas[d] === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>`).join('') : '';
+    };
+    form.querySelector('[name=categorias]').addEventListener('input', desenhar);
+    form.querySelectorAll('[name=dia]').forEach(i => i.addEventListener('change', desenhar));
+    desenhar();
   }
 
   /** Aplica o período à turma e, se pedido, gera as aulas que faltam. Devolve quantas criou. */
   function aplicarPeriodo(t, per, gerar) {
     Object.assign(t.config, per);
+    CC.aplicarCategorias(t);
     if (gerar && per.dias.length && per.inicio && per.fim && per.inicio <= per.fim) {
       return CC.gerarCronograma(t, per.inicio, per.fim, per.dias);
     }
@@ -565,12 +788,18 @@
     });
   }
 
+  /** Data de uma lista: a do nome do arquivo (ex.: …-2024jul08.xls) ou a da última modificação. */
+  function dataDoArquivo(file) {
+    return CC.dataNoNome(file.name) || (file.lastModified ? new Date(file.lastModified).toISOString().slice(0, 10) : CC.todayISO());
+  }
+
   async function atualizarLista(t) {
-    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv', false, t);
-    if (!file) return;
-    let p;
-    try { p = await lerPlanilha(file); } catch (e) { return toast('Erro ao ler: ' + e.message); }
-    if (!p.alunos.length) return toast(p.avisos[0] || 'Não encontrei alunos nessa planilha.');
+    const files = await escolherDoSistema('.xls,.xlsx,.ods,.csv', true);
+    if (!files || !files.length) return;
+    if (files.length > 1) return atualizarVariasListas(t, files);
+    const file = files[0];
+    const p = await lerComAjuda(file);
+    if (!p) return;
     if (p.meta.codigo && t.codigo && (p.meta.codigo !== t.codigo || (p.meta.turma && t.turma && p.meta.turma !== t.turma))) {
       const ok = await confirmar('Turma diferente?', `A planilha é de <b>${esc(p.meta.codigo + ' ' + p.meta.turma)}</b>, mas esta turma é <b>${esc(t.codigo + ' ' + t.turma)}</b>. Continuar mesmo assim?`, 'Continuar');
       if (!ok) return;
@@ -590,16 +819,76 @@
     toast('Lista atualizada');
   }
 
+  /** Várias listas oficiais (ex.: tiradas ao longo do semestre): aplicadas da mais antiga à mais nova, cada uma
+   *  com a sua data — assim fica registrado quando cada aluno entrou e saiu. */
+  async function atualizarVariasListas(t, files) {
+    const itens = [];
+    for (const f of files) {
+      let p; try { p = await lerPlanilha(f); } catch (e) { p = null; }
+      itens.push({ f, p, data: dataDoArquivo(f) });
+    }
+    const validos = itens.filter(i => i.p && i.p.alunos.length).sort((a, b) => a.data.localeCompare(b.data));
+    // Simula numa cópia para mostrar o que cada lista muda.
+    const copia = JSON.parse(JSON.stringify(t));
+    const linhas = validos.map(i => {
+      const pl = CC.aplicarLista(copia, i.p, i.data);
+      return `<li><b>${CC.fmtDate(i.data)}</b> · ${esc(i.f.name)} — ${i.p.alunos.length} alunos · ${pl.novos.length} novo(s) · ${pl.saem.length} saem</li>`;
+    }).join('');
+    const ruins = itens.filter(i => !i.p || !i.p.alunos.length).map(i => esc(i.f.name));
+    const r = await dialogo(`<h2>Atualizar com ${validos.length} lista(s)</h2>
+      <p class="muted small">Aplicadas em ordem de data (a do nome do arquivo ou a da última modificação). Quem sai fica "fora da lista" com a data em que saiu.</p>
+      <div class="scroll"><ol class="small">${linhas}</ol>${ruins.length ? `<p class="muted small">Sem alunos reconhecidos: ${ruins.join(', ')}</p>` : ''}</div>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok" ${validos.length ? '' : 'disabled'}>Aplicar</button></div>`);
+    if (r.acao !== 'ok') return;
+    validos.forEach(i => CC.aplicarLista(t, i.p, i.data));
+    salvar(); render();
+    toast(`${validos.length} lista(s) aplicada(s)`);
+  }
+
+  /** Várias planilhas de uma vez (ex.: turmas de semestres passados): uma turma nova para cada. */
+  async function importarVarias(arquivos) {
+    const files = arquivos || await escolherDoSistema('.xls,.xlsx,.ods,.csv', true);
+    if (!files || !files.length) return;
+    toast('Lendo ' + files.length + ' planilha(s)…');
+    const itens = [];
+    for (const f of files) {
+      let p = null; try { p = await lerPlanilha(f); } catch (e) { /* ilegível */ }
+      const id = (cod, disc, tur, per, tema) => [cod || CC.norm(disc), tur, per, tema || ''].join('|');
+      const chave = p && id(p.meta.codigo, p.meta.disciplina, p.meta.turma, p.meta.periodo, p.configuracao && p.configuracao.tema);
+      const existe = p && (p.meta.codigo || p.meta.disciplina) && (db.turmas.some(t => id(t.codigo, t.disciplina, t.turma, t.periodo, t.tema) === chave) ||
+        itens.some(i => i.chave === chave));
+      if (p) Object.defineProperty(p, 'chave', { value: chave });
+      itens.push({ f, p, existe, chave });
+    }
+    const ok = itens.filter(i => i.p && i.p.alunos.length && !i.existe);
+    const periodoAtual = (d => d.getFullYear() + (d.getMonth() < 7 ? '1' : '2'))(new Date());
+    const lin = i => !i.p ? 'não abriu' : !i.p.alunos.length ? 'sem alunos reconhecidos (importe sozinha para escolher as colunas)'
+      : i.existe ? 'já existe esta turma' : `${esc([i.p.meta.codigo, i.p.meta.turma, i.p.meta.periodo].filter(Boolean).join(' ') || i.p.meta.disciplina || '?')} · ${i.p.alunos.length} alunos`;
+    const r = await dialogo(`<h2>Importar ${files.length} planilha(s)</h2>
+      <div class="scroll"><ul class="small">${itens.map(i => `<li>${i.p && i.p.alunos.length && !i.existe ? '✓' : '—'} ${esc(i.f.name)}: ${lin(i)}</li>`).join('')}</ul></div>
+      <div class="checks"><label><input type="checkbox" name="arquivar" checked> arquivar as turmas de períodos anteriores a ${periodoAtual.slice(0, 4)}/${periodoAtual[4]}</label></div>
+      <p class="muted small">Planilhas exportadas pelo app trazem também configuração, plano de avaliação e notas.</p>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok" ${ok.length ? '' : 'disabled'}>Importar ${ok.length}</button></div>`);
+    if (r.acao !== 'ok') return;
+    ok.forEach(i => {
+      const t = CC.turmaDePlanilha(i.p, { instituicao: db.instituicao || 'UFF', dataLista: dataDoArquivo(i.f) });
+      if (r.dados.arquivar && t.periodo && String(t.periodo) < periodoAtual) t.arquivada = CC.todayISO();
+      db.turmas.push(t);
+    });
+    salvar(); render();
+    toast(`${ok.length} turma(s) importada(s)`);
+  }
+
   async function importarArquivoNaTurma(t) {
     const file = await escolherArquivo('.xls,.xlsx,.ods,.csv', false, t);
     if (!file) return;
-    let p;
-    try { p = await lerPlanilha(file); } catch (e) { return toast('Erro ao ler: ' + e.message); }
-    importarNaTurma(t, p, file.name);
+    const p = await lerComAjuda(file);
+    if (p) importarNaTurma(t, p, file.name);
   }
 
   async function importarNaTurma(t, p, nomeArq) {
-    if (!p.datas.length && !p.cronograma.length && !p.notas.length) {
+    if (!p.alunos.length) return toast(p.avisos[0] || 'Não encontrei alunos nessa planilha.');
+    if (!p.datas.length && !p.cronograma.length && !p.notas.length && !p.notasApp) {
       // Só a lista: tratar como atualização da lista oficial.
       const plano = CC.aplicarLista(t, p);
       salvar(); render();
@@ -608,10 +897,10 @@
     const r = await dialogo(`<h2>Importar de ${esc(nomeArq)}</h2>
       <p class="muted small">Só preenche o que ainda está vazio no app; nada que você já marcou é sobrescrito.
       Alunos da planilha que não estão na lista oficial entram como "fora da lista".</p>
-      ${opcoesImportacao(p)}
+      ${opcoesImportacao(p, t)}
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Importar</button></div>`);
     if (r.acao !== 'ok') return;
-    const res = CC.importarDados(t, p, lerOpcoes(r.dados, p));
+    const res = CC.importarDados(t, p, lerOpcoes(r.dados, p, t));
     salvar(); render();
     toast(`${res.aulasNovas} aulas, ${res.marcacoes} marcações, ${res.notas} notas, ${res.alunosNovos} alunos novos`);
   }
@@ -681,7 +970,7 @@
   }
 
   function entregarPlanilha(t, lista) {
-    const wb = CC.montarPlanilha(XLSX, t, cursos(), { lista });
+    const wb = CC.montarPlanilha(XLSX, t, cursos(t), { lista });
     const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
     entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'planilha', 'xlsx'), t);
   }
@@ -717,7 +1006,7 @@
     if (r.acao === 'xlsx') { if (!semXLSX()) entregarPlanilha(t, ol); return; }
     toast('Gerando PDF…');
     let blob;
-    try { blob = await ListaPDF.gerar(CC.dadosListaPresenca(t, cursos(), ol)); }
+    try { blob = await ListaPDF.gerar(CC.dadosListaPresenca(t, cursos(t), ol)); }
     catch (e) { return toast('Não consegui gerar o PDF: ' + e.message); }
     const rotulo = ol.titulo || (ol.data ? CC.fmtDate(ol.data).slice(0, 5).replace('/', '-') : '');
     entregarArquivo(blob, CC.nomeArquivo(t, 'lista de presença' + (rotulo ? ' ' + rotulo : ''), 'pdf'), t);
@@ -730,24 +1019,32 @@
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(t.codigo)}"></label>
       <label class="field grow">Turma<input type="text" name="turma" value="${esc(t.turma)}"></label>
       <label class="field grow">Período<input type="text" name="periodo" value="${esc(t.periodo)}"></label></div>
+      ${campoInstituicao(t.instituicao || '')}
+      ${campoTema(t.tema || '')}
       <label class="field">Nome curto (nos nomes dos arquivos)<input type="text" name="nomeCurto" maxlength="40" value="${esc(t.nomeCurto || '')}" placeholder="${esc(CC.nomeCurto(Object.assign({}, t, { nomeCurto: '' })))}"></label>
       <div class="row nowrap">
       <label class="field grow">Atraso vale (faltas)<input type="number" step="0.05" min="0" max="1" name="pesoAtraso" value="${c.pesoAtraso}"></label>
       <label class="field grow">Frequência mínima (%)<input type="number" min="0" max="100" name="freqMin" value="${c.freqMin}"></label>
       <label class="field grow">Média mínima<input type="number" step="0.1" min="0" max="10" name="mediaMin" value="${c.mediaMin}"></label></div>
-      <label class="field">Com média parcial a partir de (faz VS)<input type="number" step="0.1" min="0" max="10" name="mediaVS" value="${c.mediaVS}"></label>
+      <div class="row nowrap">
+      <label class="field grow">Com média parcial a partir de (faz VS)<input type="number" step="0.1" min="0" max="10" name="mediaVS" value="${c.mediaVS}"></label>
+      <label class="field grow">Média mínima na pós (sem VS)<input type="number" step="0.1" min="0" max="10" name="mediaMinPos" value="${c.mediaMinPos == null ? '' : c.mediaMinPos}" placeholder="igual à graduação"></label></div>
       ${camposPeriodo(c, false)}
       <p class="muted small">Hoje: ${CC.aulasPrevistas(t)} aulas no período; reprova quem tiver mais de ${CC.numBR(CC.limiteFaltas(t), CC.limiteFaltas(t) % 1 ? 1 : 0)} faltas.
       Sem carga horária, conta as aulas do cronograma.</p></div>
-      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`, ligarPeriodo);
     if (r.acao !== 'ok') return;
-    ['disciplina', 'codigo', 'turma', 'periodo'].forEach(k => { t[k] = r.dados[k].trim(); });
+    ['disciplina', 'codigo', 'turma', 'periodo', 'instituicao'].forEach(k => { t[k] = String(r.dados[k] || '').trim(); });
     const curto = String(r.dados.nomeCurto || '').trim();
     if (curto) t.nomeCurto = curto; else delete t.nomeCurto;
+    const tema = String(r.dados.tema || '').trim();
+    if (tema) t.tema = tema; else delete t.tema;
     ['pesoAtraso', 'freqMin', 'mediaMin', 'mediaVS'].forEach(k => {
       const v = parseFloat(String(r.dados[k]).replace(',', '.'));
       if (!isNaN(v)) c[k] = v;
     });
+    const vPos = parseFloat(String(r.dados.mediaMinPos || '').replace(',', '.'));
+    c.mediaMinPos = isNaN(vPos) ? null : vPos;
     delete c.totalAulas;
     const novas = aplicarPeriodo(t, lerPeriodo(r.dados), !!r.dados.gerar);
     salvar(); render();
@@ -790,9 +1087,9 @@
 
   /* ---------- cursos ---------- */
 
-  function resumoCursos(alunos) {
+  function resumoCursos(t, alunos) {
     const n = {};
-    alunos.forEach(a => { const c = cursoDe(a) || 'sem matrícula'; n[c] = (n[c] || 0) + 1; });
+    alunos.forEach(a => { const c = cursoDe(t, a) || 'sem matrícula'; n[c] = (n[c] || 0) + 1; });
     return Object.keys(n).sort((x, y) => n[y] - n[x]).map(c => esc(c) + ': ' + n[c]).join(' · ');
   }
 
@@ -853,7 +1150,7 @@
       for (let k = 0; k < fotos.length; k++) {
         const r = await OCR.lerFolha(fotos[k], alunos, (st, p) => {
           progressoOCR((fotos.length > 1 ? `Foto ${k + 1} de ${fotos.length}: ` : '') + (ETAPAS_OCR[st] || 'Processando…'), st === 'recognizing text' ? p : 0);
-        }, cursoDe);
+        }, a => cursoDe(t, a));
         if (r.tipo === 'impressa') tipo = 'impressa';
         linhas = linhas.concat(r.linhas);
       }
@@ -924,7 +1221,7 @@
 
   function barraVisao(t, total, lista) {
     const v = visaoDe(t);
-    const cursosT = Array.from(new Set(CC.alunosOrdenados(t, false).map(cursoDe).filter(Boolean))).sort();
+    const cursosT = Array.from(new Set(CC.alunosOrdenados(t, false).map(a => cursoDe(t, a)).filter(Boolean))).sort();
     const sel = (id, obj, atual) => `<select id="${id}">${Object.keys(obj).map(k => `<option value="${k}" ${atual === k ? 'selected' : ''}>${obj[k].rotulo}</option>`).join('')}</select>`;
     return `<div class="card barra-visao"><div class="row nowrap">
       <label class="field grow">Mostrar${sel('v-filtro', CC.FILTROS, v.filtro)}</label>
@@ -1189,7 +1486,7 @@
       <div class="aula-nav">
         <button class="icon-btn" id="ant" ${i <= 0 ? 'disabled' : ''} aria-label="Aula anterior" style="color:var(--text)">&#8249;</button>
         <div class="info" id="info-aula" style="cursor:pointer">
-          <div class="data">${CC.fmtDate(aula.data, true)}${aula.data === hoje ? ' · hoje' : ''}${rotuloChamada(t, aula)}</div>
+          <div class="data">${CC.fmtDate(aula.data, true)}${aula.data === hoje ? ' · hoje' : ''}${rotuloChamada(t, aula)}${aula.categoria ? ' · ' + esc(aula.categoria) : ''}</div>
           <div class="conteudo">${esc(aula.conteudo || 'Aula ' + (i + 1) + ' de ' + aulas.length)}</div>
         </div>
         <button class="icon-btn" id="prox" ${i >= aulas.length - 1 ? 'disabled' : ''} aria-label="Próxima aula" style="color:var(--text)">&#8250;</button>
@@ -1298,7 +1595,7 @@
   function linhaChamada(t, a, v, obs) {
     return `<div class="aluno-row ${a.ativo ? '' : 'inativo'}" data-id="${a.id}" data-busca="${esc(CC.norm(a.nome + ' ' + a.matricula))}">
       <div class="nome">${esc(nomeCurto(a.nome))}${obs ? ' <span class="obs-dot" title="Observação">●</span>' : ''}
-        <div class="det">${textoFaltas(t, a)} · ${esc(a.matricula)}${cursoDe(a) ? ' · ' + esc(cursoDe(a)) : ''}${a.ativo ? '' : ' · fora da lista'}</div></div>
+        <div class="det">${textoFaltas(t, a)} · ${esc(a.matricula)}${cursoDe(t, a) ? ' · ' + esc(cursoDe(t, a)) : ''}${a.ativo ? '' : ' · fora da lista'}</div></div>
       <div class="st-group">${['P', 'A', 'J', 'F'].map(s => `<button class="st ${s} ${v === s ? 'on' : ''}" data-st="${s}" aria-label="${CC.STATUS_LABEL[s]}">${s}</button>`).join('')}</div>
     </div>`;
   }
@@ -1387,11 +1684,11 @@
     const todos = CC.alunosOrdenados(t, true);
     const ativos = todos.filter(a => a.ativo).length;
     const v = Object.assign({}, visaoDe(t), { inativos: true });
-    const lista = CC.alunosVisao(t, v, cursoDe);
+    const lista = CC.alunosVisao(t, v, a => cursoDe(t, a));
     let h = `<div class="card"><div class="row"><div class="grow">
       <b>${ativos}</b> inscritos${todos.length > ativos ? ` · <span class="muted">${todos.length - ativos} fora da lista</span>` : ''}
       <div class="muted small">${t.listaEm ? 'Lista oficial atualizada em ' + CC.fmtDate(t.listaEm) : 'Lista oficial ainda não importada'}</div>
-      <div class="muted small">${resumoCursos(todos.filter(a => a.ativo))}</div></div>
+      <div class="muted small">${CC.ehUFF(t) ? resumoCursos(t, todos.filter(a => a.ativo)) : ""}</div></div>
       <button class="btn small" id="atualizar">Atualizar lista</button></div></div>`;
     if (!todos.length) {
       h += `<div class="card empty">Sem alunos. Importe a lista do sistema ou adicione à mão.</div>`;
@@ -1399,7 +1696,7 @@
       h += barraVisao(t, todos.length, lista);
       h += `<div class="lista-chamada">` + (lista.length ? lista.map(({ a, st }) => `<div class="aluno-row ${a.ativo ? '' : 'inativo'}" data-id="${a.id}">
           <div class="nome">${esc(nomeCurto(a.nome))}
-          <div class="det">${esc(a.matricula || 'sem matrícula')}${cursoDe(a) ? ' · ' + esc(cursoDe(a)) : ''}${a.ativo ? '' : ' · fora da lista' + (a.saiuEm ? ' (' + esc(a.saiuEm.includes('-') ? CC.fmtDate(a.saiuEm) : a.saiuEm) + ')' : '')}${a.origem === 'manual' ? ' · incluído à mão' : ''}</div></div>
+          <div class="det">${esc(a.matricula || 'sem matrícula')}${cursoDe(t, a) ? ' · ' + esc(cursoDe(t, a)) : ''}${a.ativo ? '' : ' · fora da lista' + (a.saiuEm ? ' (' + esc(a.saiuEm.includes('-') ? CC.fmtDate(a.saiuEm) : a.saiuEm) + ')' : '')}${a.origem === 'manual' ? ' · incluído à mão' : ''}</div></div>
           <div class="right small num">${CC.numBR(st.faltas)} F${st.media != null ? ' · ' + CC.numBR(st.mf != null ? st.mf : st.media) : ''}${st.sitNota.cod ? ` <span class="tag ${st.sitNota.cod}">${{ RF: 'RF', OK: 'OK', VS: 'VS', BAIXA: '↓' }[st.sitNota.cod]}</span>` : ''}</div></div>`).join('')
         : '<div class="empty">Nenhum aluno neste filtro.</div>') + '</div>';
     }
@@ -1416,7 +1713,9 @@
     a = a || { nome: '', matricula: '', email: '', cpf: '' };
     const r = await dialogo(`<h2>${novo ? 'Novo aluno' : 'Editar aluno'}</h2><div class="stack">
       <label class="field">Nome<input type="text" name="nome" value="${esc(a.nome)}" required autofocus></label>
-      <label class="field">Matrícula<input type="text" name="matricula" inputmode="numeric" value="${esc(a.matricula)}"></label>
+      <label class="field">Matrícula<input type="text" name="matricula" value="${esc(a.matricula)}" placeholder="graduação: 9 dígitos · pós: M048.126.009 ou CPF"></label>
+      <label class="field">Vínculo<select name="vinculo"><option value="">Pela matrícula${(v => v ? ' (' + CC.VINCULOS[v] + ')' : '')(novo ? '' : CC.vinculoAluno(t, Object.assign({}, a, { vinculo: '' })))}</option>
+        ${Object.keys(CC.VINCULOS).map(k => `<option value="${k}" ${a.vinculo === k ? 'selected' : ''}>${CC.VINCULOS[k]}</option>`).join('')}</select></label>
       <label class="field">E-mail<input type="text" name="email" inputmode="email" value="${esc(a.email)}"></label>
       ${novo ? '' : `<label class="checks"><label><input type="checkbox" name="ativo" ${a.ativo ? 'checked' : ''}> inscrito (aparece na chamada)</label></label>`}
       </div>
@@ -1433,9 +1732,10 @@
     const mat = r.dados.matricula.trim();
     if (mat && t.alunos.some(x => x !== a && x.matricula === mat)) return toast('Já existe aluno com essa matrícula');
     if (novo) {
-      t.alunos.push({ id: CC.uid('a'), nome, matricula: mat, email: r.dados.email.trim(), cpf: '', origem: 'manual', ativo: true, entrouEm: CC.todayISO(), saiuEm: null });
+      t.alunos.push({ id: CC.uid('a'), nome, matricula: mat, email: r.dados.email.trim(), cpf: '', vinculo: r.dados.vinculo || '', origem: 'manual', ativo: true, entrouEm: CC.todayISO(), saiuEm: null });
     } else {
       a.nome = nome; a.matricula = mat; a.email = r.dados.email.trim();
+      if (r.dados.vinculo) a.vinculo = r.dados.vinculo; else delete a.vinculo;
       const ativo = !!r.dados.ativo;
       if (a.ativo && !ativo) a.saiuEm = CC.todayISO();
       if (ativo) a.saiuEm = null;
@@ -1452,14 +1752,27 @@
     let h = `<div class="card"><div class="row nowrap"><div class="grow">
       <h2>${esc(nomeCurto(a.nome))}</h2>
       <div class="muted small">${esc(a.matricula)}${a.email ? ' · ' + esc(a.email) : ''}</div>
-      ${(i => i ? `<div class="small">${esc(i.curso)} <span class="muted">· ingresso ${esc(i.ingresso)}</span></div>` : '')(CC.infoMatricula(a.matricula, cursos()))}
+      ${(i => cursoDe(t, a) ? `<div class="small">${esc(cursoDe(t, a))}${i ? ` <span class="muted">· ${i.nivel === 'grad' ? 'ingresso ' : ''}${esc(i.ingresso)}</span>` : ''}</div>` : '')(CC.infoMatricula(a.matricula, cursos(t)))}
       ${a.ativo ? '' : '<span class="tag fora">fora da lista</span>'}</div>
       <div class="stack" style="flex:none"><button class="btn small" id="editar">Editar</button>${a.email ? '<button class="btn small" id="mail-aluno">✉ E-mail</button>' : ''}</div></div>
       <div class="contadores"><span class="c-P">${st.P} P</span><span class="c-A">${st.A} A</span><span class="c-J">${st.J} J</span><span class="c-F">${st.F} F</span></div>
       <p class="small" style="margin:10px 0 0">Faltas: <b>${CC.numBR(st.faltas)}</b> de ${limTxt(t)} permitidas
       ${st.freq != null ? ' · frequência ' + Math.round(st.freq * 100) + '%' : ''}
       ${st.media != null ? ' · média ' + CC.numBR(st.media) : ''}${CC.avaliacaoTipo(t, 'VS') && st.mf != null && st.mf !== st.media ? ' · MF ' + CC.numBR(st.mf) : ''}
-      ${st.situacao.texto ? ` <span class="tag ${st.situacao.cod}">${st.situacao.texto}</span>` : ''}</p></div>`;
+      ${st.situacao.texto ? ` <span class="tag ${st.situacao.cod}">${st.situacao.texto}</span>` : ''}</p>
+      ${Object.keys(st.porCategoria).length > 1 ? `<p class="small muted" style="margin:6px 0 0">${Object.keys(st.porCategoria).sort().map(k => {
+        const x = st.porCategoria[k];
+        return `${esc(k)}: ${CC.numBR(x.faltas, x.faltas % 1 ? 1 : 0)} falta(s) em ${x.aulas} aula(s)`;
+      }).join(' · ')}</p>` : ''}</div>`;
+    const hist = CC.historicoAluno(db.turmas, t, a);
+    if (hist.length) {
+      h += `<div class="card"><h3>Em outras turmas</h3>` + hist.map(({ t: u, a: b }) => {
+        const s = CC.statsAluno(u, b);
+        const sit = !b.ativo ? 'fora da lista' : (s.sitNota.texto || (s.registradas ? 'frequência ' + Math.round(s.freq * 100) + '%' : ''));
+        return `<a class="row small hist" href="#/t/${u.id}/aluno/${b.id}"><span class="grow">${esc(CC.periodoCurto(u.periodo))} · ${esc(CC.disciplinaTema(u))}${u.turma ? ' (' + esc(u.turma) + ')' : ''}</span>
+          <span class="muted">${esc(sit)}${s.mf != null ? ' · MF ' + CC.numBR(s.mf) : ''}</span></a>`;
+      }).join('') + '</div>';
+    }
     if (t.avaliacoes.length) {
       h += `<div class="card"><h3>Notas</h3>` + t.avaliacoes.map(v => {
         const n = (t.notas[v.id] || {})[a.id];
@@ -1494,7 +1807,7 @@
       return `<div class="aula-item ${aula.data === hoje ? 'hoje' : ''} ${aula.tipo}" data-id="${aula.id}">
         <div class="quando">${CC.fmtDate(aula.data)}<div class="dia">${CC.DIAS[CC.weekday(aula.data)]}${rotuloChamada(t, aula).replace(' · ', ' · ').replace(' chamada', '')}</div></div>
         <div class="grow"><div>${esc(aula.conteudo || (aula.tipo === 'aula' ? '' : CC.TIPOS[aula.tipo]))}</div>
-        <div class="badge">${aula.tipo !== 'aula' ? CC.TIPOS[aula.tipo] : ''}${feita ? (aula.tipo !== 'aula' ? ' · ' : '') + c.P + ' P · ' + c.A + ' A · ' + c.J + ' J · ' + c.F + ' F' : ''}</div></div>
+        <div class="badge">${aula.categoria && aula.tipo !== 'sem-aula' ? `<span class="tag cat">${esc(aula.categoria)}</span> ` : ''}${aula.tipo !== 'aula' ? CC.TIPOS[aula.tipo] : ''}${feita ? (aula.tipo !== 'aula' ? ' · ' : '') + c.P + ' P · ' + c.A + ' A · ' + c.J + ' J · ' + c.F + ' F' : ''}</div></div>
         ${aula.tipo !== 'sem-aula' ? `<button class="btn small" data-chamada="${aula.id}">${feita ? 'Ver' : 'Chamada'}</button>` : ''}</div>`;
     }).join('') : '<div class="empty">Nenhuma aula. Use "Gerar datas" ou adicione uma por uma.</div>') + '</div>';
     h += `<button class="fab" id="add">+ Aula</button>`;
@@ -1532,10 +1845,13 @@
   async function editarAula(t, aula) {
     const nova = !aula;
     const a = aula || { data: CC.todayISO(), conteudo: '', tipo: 'aula' };
+    const cats = t.config.categorias || [];
     const r = await dialogo(`<h2>${nova ? 'Nova aula' : 'Aula'}</h2><div class="stack">
       <label class="field">Data<input type="date" name="data" value="${a.data}" required></label>
       <label class="field">Tipo<select name="tipo">${Object.keys(CC.TIPOS).map(k => `<option value="${k}" ${a.tipo === k ? 'selected' : ''}>${CC.TIPOS[k]}</option>`).join('')}</select></label>
       <label class="field">Conteúdo / observação<input type="text" name="conteudo" value="${esc(a.conteudo)}" placeholder="ex.: Autômatos finitos; Feriado; P1"></label>
+      ${cats.length ? `<label class="field">Tipo de aula<select name="categoria"><option value="">— (pelo dia da semana)</option>
+        ${cats.map(c => `<option ${a.categoriaFixa && a.categoria === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select></label>` : ''}
       </div>
       <div class="acoes">${nova ? '' : '<button class="btn danger" value="remover" formnovalidate>Excluir</button><button class="btn" value="presenca" formnovalidate>Lista de presença</button>'}
       <button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
@@ -1547,14 +1863,18 @@
       return;
     }
     if (r.acao !== 'ok' || !r.dados.data) return;
+    let alvo = aula;
     if (nova) {
       const doDia = t.aulas.filter(x => x.data === r.dados.data).length;
-      t.aulas.push({ id: CC.uid('d'), data: r.dados.data, conteudo: r.dados.conteudo.trim(), tipo: r.dados.tipo, ordem: doDia });
+      alvo = { id: CC.uid('d'), data: r.dados.data, conteudo: r.dados.conteudo.trim(), tipo: r.dados.tipo, ordem: doDia };
+      t.aulas.push(alvo);
     } else {
       aula.data = r.dados.data;
       aula.tipo = r.dados.tipo;
       aula.conteudo = r.dados.conteudo.trim();
     }
+    if (r.dados.categoria) { alvo.categoria = r.dados.categoria; alvo.categoriaFixa = true; }
+    else { delete alvo.categoriaFixa; alvo.categoria = CC.categoriaPadrao(t, alvo.data); }
     salvar(); render();
   }
 
@@ -1587,7 +1907,7 @@
           <input type="text" inputmode="decimal" class="nota-input" data-aluno="${a.id}" value="${typeof n === 'number' ? String(n).replace('.', ',') : ''}" enterkeyhint="next"></div>`;
       }).join('') + '</div>';
     } else if (avs.length) {
-      const lista = CC.alunosVisao(t, visaoDe(t), cursoDe);
+      const lista = CC.alunosVisao(t, visaoDe(t), a => cursoDe(t, a));
       h += cartaoEstatisticas(t) + barraVisao(t, CC.alunosOrdenados(t, false).length, lista) + tabelaNotas(t, lista);
       listaNotas = lista;
     } else {
@@ -1677,7 +1997,7 @@
     const todos = CC.alunosOrdenados(t, false);
     const temNotas = t.avaliacoes.length > 0;
     const temVS = !!CC.avaliacaoTipo(t, 'VS');
-    const stats = CC.alunosVisao(t, visaoDe(t), cursoDe);
+    const stats = CC.alunosVisao(t, visaoDe(t), a => cursoDe(t, a));
     const todosStats = todos.map(a => CC.statsAluno(t, a));
     const rf = todosStats.filter(s => s.situacao.cod === 'RF').length;
     const lim = todosStats.filter(s => s.situacao.cod === 'LIM').length;
@@ -1713,7 +2033,7 @@
       if (recarregando) return;
       recarregando = true;
       try { sessionStorage.setItem('cc-atualizado', '1'); } catch (e) { /* sem sessionStorage */ }
-      try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* sem espaço */ }
+      clearTimeout(salvarTimer); gravarAgora();
       location.reload();
     };
     navigator.serviceWorker.addEventListener('controllerchange', () => {
@@ -1736,6 +2056,16 @@
     }
   } catch (e) { /* sem sessionStorage */ }
   // Ganchos para depuração no console.
-  window.__cc = { get db() { return db; }, salvar, render, cursos };
+  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma };
+  // O IndexedDB pode ter dados mais novos (ou os únicos, quando não couberam no localStorage).
+  if (window.indexedDB) {
+    idbLer().then(json => {
+      const estava = aguardandoIDB;
+      aguardandoIDB = false;
+      if (!json) { if (db.turmas.length) gravarAgora(); return; }
+      const d = JSON.parse(json);
+      if (estava || (d.salvoEm || 0) > (db.salvoEm || 0)) { db = normalizarDb(d); render(); }
+    }).catch(() => { aguardandoIDB = false; });
+  }
   render();
 })();

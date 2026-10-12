@@ -1,5 +1,5 @@
 /* Service worker: deixa o app funcionando sem internet. */
-const VERSAO = '0.4.0';
+const VERSAO = '0.7.0';
 const CACHE = 'chamada-' + VERSAO;
 const v = arq => arq + '?v=' + VERSAO;  // mesmos endereços usados no index.html
 const SHELL = [

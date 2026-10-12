@@ -57,15 +57,18 @@
     await carregar();
     const doc = new g.jspdf.jsPDF({ unit: 'mm', format: 'a4', orientation: 'portrait' });
     doc.setProperties({ title: dl.titulo + ' — ' + dl.disciplina });
-    const xs = COLS.reduce((acc, w) => acc.concat(acc[acc.length - 1] + w), [MARG]);
+    // Sem curso (instituição fora da regra da UFF): a coluna some e o nome ganha o espaço.
+    const cols = dl.linhas.some(l => l.curso) ? COLS : [COLS[0], COLS[1], COLS[2] + COLS[3], 0, COLS[4]];
+    const xs = cols.reduce((acc, w) => acc.concat(acc[acc.length - 1] + w), [MARG]);
 
     function cabecalhoTabela(y) {
       doc.setFillColor(...AZUL);
       doc.rect(MARG, y, LARG, ALT_CAB, 'F');
       doc.setTextColor(255, 255, 255); doc.setFont('helvetica', 'bold');
       CAB.forEach((h, c) => {
+        if (!cols[c]) return;
         if (c === 2) texto(doc, [h], xs[c] + 1.5, y, ALT_CAB, 9);
-        else texto(doc, [h], xs[c] + COLS[c] / 2, y, ALT_CAB, 9, { centro: true });
+        else texto(doc, [h], xs[c] + cols[c] / 2, y, ALT_CAB, 9, { centro: true });
       });
       return y + ALT_CAB;
     }
@@ -94,20 +97,20 @@
       }
       if (i % 2) { doc.setFillColor(244, 246, 248); doc.rect(MARG, y, LARG, ALT_LINHA, 'F'); }
       doc.setDrawColor(190, 190, 190); doc.setLineWidth(0.2);
-      COLS.forEach((w, c) => doc.rect(xs[c], y, w, ALT_LINHA));
+      cols.forEach((w, c) => { if (w) doc.rect(xs[c], y, w, ALT_LINHA); });
       doc.setFont('helvetica', 'normal');
       doc.setTextColor(...CINZA);
-      texto(doc, [String(i + 1)], xs[0] + COLS[0] / 2, y, ALT_LINHA, 8, { centro: true });
+      texto(doc, [String(i + 1)], xs[0] + cols[0] / 2, y, ALT_LINHA, 8, { centro: true });
       const cor = l.risca ? RISCADO : TEXTO;
       doc.setTextColor(...cor); doc.setDrawColor(...cor);
-      if (l.matricula) texto(doc, [l.matricula], xs[1] + COLS[1] / 2, y, ALT_LINHA, 9.5, { centro: true, risca: l.risca });
+      if (l.matricula) texto(doc, [l.matricula], xs[1] + cols[1] / 2, y, ALT_LINHA, 9.5, { centro: true, risca: l.risca });
       if (l.nome) {
-        const n = caber(doc, l.nome, COLS[2] - 3, 9.5, 7.5, 2);
+        const n = caber(doc, l.nome, cols[2] - 3, 9.5, 7.5, 2);
         texto(doc, n.linhas, xs[2] + 1.5, y, ALT_LINHA, n.tam, { risca: l.risca });
       }
       if (l.curso) {
         doc.setTextColor(...(l.risca ? RISCADO : CINZA));
-        const c = caber(doc, l.curso, COLS[3] - 2, 6.5, 5.5, 2);
+        const c = caber(doc, l.curso, cols[3] - 2, 6.5, 5.5, 2);
         texto(doc, c.linhas, xs[3] + 1, y, ALT_LINHA, c.tam, { risca: l.risca });
       }
       y += ALT_LINHA;
