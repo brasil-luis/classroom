@@ -3,7 +3,7 @@
 App web instalável (PWA) para fazer chamada pelo celular Android e organizar a turma.
 Funciona offline; os dados ficam só no aparelho.
 
-**Versão 0.3.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
+**Versão 0.3.1** — a numeração fica em 0.x até o app ter todas as funcionalidades
 planejadas; aí vira 1.0.
 
 ## O que faz
@@ -70,4 +70,6 @@ e abra `http://localhost:8765/`.
 - `js/cursos-uff.js` — códigos de curso da UFF (tabela de 2006)
 - `sw.js`, `manifest.webmanifest`, `icons/` — PWA (`tools/make_icons.py` gera os ícones)
 
-Ao publicar uma versão nova, atualize `VERSAO` em `js/app.js` e `CACHE` em `sw.js`.
+Ao publicar uma versão nova, rode `python tools/nova_versao.py X.Y.Z` (troca a versão em
+`js/app.js`, `sw.js` e nos endereços do `index.html`). O app instalado procura a versão nova ao
+abrir e ao voltar para a tela, recarrega sozinho e avisa "App atualizado para a versão X.Y.Z".

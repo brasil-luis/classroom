@@ -10,7 +10,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.3.0';
+  const VERSAO = '0.3.1';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -275,6 +275,7 @@
         (arquivadas.length ? `<details class="arquivo"><summary>Turmas arquivadas (${arquivadas.length})</summary>${arquivadas.map(cartao).join('')}</details>` : '') +
         `<button class="fab" id="imp">+ Importar planilha</button>`;
     }
+    app.insertAdjacentHTML('beforeend', `<p class="muted small versao">Chamada · versão ${VERSAO}</p>`);
     const imp = $('#imp'); if (imp) imp.onclick = importarNovaTurma;
     const nova = $('#nova'); if (nova) nova.onclick = criarTurmaVazia;
     const rest = $('#restaurar'); if (rest) rest.onclick = restaurarBackup;
@@ -1587,9 +1588,37 @@
 
   /* ---------- início ---------- */
 
+  /* Atualização: procura versão nova ao abrir e ao voltar para o app; quando o service worker
+   * novo assume, recarrega (esperando fechar um diálogo aberto) e avisa a versão. */
   if ('serviceWorker' in navigator && location.protocol !== 'file:') {
-    navigator.serviceWorker.register('sw.js').catch(e => console.warn('SW', e));
+    const jaControlada = !!navigator.serviceWorker.controller;
+    let recarregando = false;
+    const recarregar = () => {
+      if (recarregando) return;
+      recarregando = true;
+      try { sessionStorage.setItem('cc-atualizado', '1'); } catch (e) { /* sem sessionStorage */ }
+      try { localStorage.setItem(KEY, JSON.stringify(db)); } catch (e) { /* sem espaço */ }
+      location.reload();
+    };
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!jaControlada) return;               // primeira instalação: nada a recarregar
+      const dlg = $('#dlg');
+      if (dlg.open) dlg.addEventListener('close', recarregar, { once: true });
+      else recarregar();
+    });
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(reg => {
+      reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') reg.update().catch(() => {});
+      });
+    }).catch(e => console.warn('SW', e));
   }
+  try {
+    if (sessionStorage.getItem('cc-atualizado')) {
+      sessionStorage.removeItem('cc-atualizado');
+      setTimeout(() => toast('App atualizado para a versão ' + VERSAO), 300);
+    }
+  } catch (e) { /* sem sessionStorage */ }
   // Ganchos para depuração no console.
   window.__cc = { get db() { return db; }, salvar, render, cursos };
   render();

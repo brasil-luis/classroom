@@ -1,8 +1,10 @@
 /* Service worker: deixa o app funcionando sem internet. */
-const CACHE = 'chamada-0.3.0';
+const VERSAO = '0.3.1';
+const CACHE = 'chamada-' + VERSAO;
+const v = arq => arq + '?v=' + VERSAO;  // mesmos endereços usados no index.html
 const SHELL = [
-  './', 'index.html', 'css/app.css', 'js/core.js', 'js/app.js', 'manifest.webmanifest',
-  'js/cursos-uff.js', 'js/ocr.js', 'js/pasta.js', 'icons/icon-192.png', 'icons/icon-512.png',
+  './', 'index.html', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png',
+  v('css/app.css'), v('js/cursos-uff.js'), v('js/core.js'), v('js/ocr.js'), v('js/pasta.js'), v('js/app.js'),
   'https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js'
 ];
 

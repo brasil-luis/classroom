@@ -280,3 +280,4 @@ code { font-size: 12px; background: var(--surface-2); padding: 0 3px; border-rad
 @media (max-width: 480px) { .opc { display: none; } .hist { width: 64px; } }
 .menu-list.arquivos button { display: flex; justify-content: space-between; gap: 8px; }
 .menu-list.arquivos .muted { flex: none; }
+.versao { text-align: center; margin: 28px 0 70px; }
