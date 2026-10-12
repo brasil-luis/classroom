@@ -1,5 +1,8 @@
 /* ClassroomControl — interface. Rotas por hash:
- *   #/                         turmas
+ *   #/                         turmas (ativas) e projetos
+ *   #/pessoas                  alunos de todas as turmas
+ *   #/p/{id}[/calendario]      projeto: disciplinas; calendário letivo
+ *   #/d/{id}                   disciplina: turmas
  *   #/t/{id}/chamada[/{aula}]  chamada
  *   #/t/{id}/alunos            alunos
  *   #/t/{id}/aluno/{aluno}     histórico de um aluno
@@ -10,7 +13,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.7.0';
+  const VERSAO = '0.8.0';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -27,7 +30,7 @@
   function normalizarDb(dados) {
     dados.turmas = dados.turmas || [];
     dados.turmas.forEach(t => { t.config = Object.assign({}, CC.DEFAULT_CONFIG, t.config); delete t.config.totalAulas; });
-    return dados;
+    return CC.organizar(dados);   // projetos e disciplinas (bancos antigos: criados a partir das turmas)
   }
 
   function carregar() {
@@ -36,7 +39,7 @@
       if (raw) return normalizarDb(JSON.parse(raw));
       aguardandoIDB = !!localStorage.getItem(KEY_IDB);
     } catch (e) { console.error(e); }
-    return { versao: 1, turmas: [] };
+    return { versao: 1, turmas: [], projetos: [], disciplinas: [] };
   }
 
   let idbPromessa = null;
@@ -175,9 +178,13 @@
     if (!varios && exts.length && Pasta.suportada) {
       const pasta = await Pasta.da(t);
       if (pasta) {
-        let arqs = [];
-        try { arqs = await Pasta.listar(pasta.handle, exts); } catch (e) { /* pasta indisponível */ }
-        const r = await dialogo(`<h2>Abrir de “${esc(pasta.handle.name)}”</h2>
+        let arqs = [], dir = pasta.handle;
+        const sub = subpastaDe(pasta, t);
+        try {
+          if (sub) dir = await pasta.handle.getDirectoryHandle(sub);
+          arqs = await Pasta.listar(dir, exts);
+        } catch (e) { /* pasta indisponível */ }
+        const r = await dialogo(`<h2>Abrir de “${esc(pasta.handle.name + (sub ? '/' + sub : ''))}”</h2>
           ${arqs.length ? `<ul class="menu-list arquivos">${arqs.slice(0, 40).map((a, i) => `<li><button value="${i}">${esc(a.nome)}<span class="muted small">${new Date(a.data).toLocaleString('pt-BR', { dateStyle: 'short', timeStyle: 'short' })}</span></button></li>`).join('')}</ul>`
             : `<p class="muted">Nenhum arquivo ${exts.join(' / ')} nesta pasta.</p>`}
           <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn" value="outro">Outro arquivo…</button></div>`);
@@ -192,6 +199,7 @@
   function escolherDoSistema(accept, varios) {
     const input = $('#file-input');
     input.value = '';
+    input.webkitdirectory = false;
     input.accept = accept;
     input.multiple = !!varios;
     return new Promise(resolve => {
@@ -284,13 +292,22 @@
     return ok ? escolherColunas(p.wb, file.name) : null;
   }
 
-  /** Entrega um arquivo gerado: na pasta de trabalho, "salvar como", compartilhar ou baixar. */
-  async function entregarArquivo(blob, nome, t) {
-    const file = new File([blob], nome, { type: blob.type });
+  /** Subpasta da disciplina dentro da pasta do projeto (padrão UFF-código-sigla), quando é a pasta do projeto. */
+  function subpastaDe(pasta, t) {
+    const d = t && CC.disciplinaDe(db, t);
+    return pasta && pasta.chave.startsWith('p:') && d && d.pasta ? d.pasta : '';
+  }
+
+  /** Entrega um arquivo gerado: na pasta de trabalho, "salvar como", compartilhar ou baixar.
+   *  nomeNaPasta: nome a usar dentro da pasta da disciplina (na pasta do projeto). */
+  async function entregarArquivo(blob, nome, t, nomeNaPasta) {
     const pasta = await Pasta.da(t);
+    const sub = subpastaDe(pasta, t);
+    if (sub && nomeNaPasta) nome = nomeNaPasta;
+    const file = new File([blob], nome, { type: blob.type });
     const podeCompartilhar = !!(navigator.canShare && navigator.canShare({ files: [file] }));
     const opcoes = [];
-    if (pasta) opcoes.push(['pasta', `Salvar em “${pasta.handle.name}”`]);
+    if (pasta) opcoes.push(['pasta', `Salvar em “${pasta.handle.name}${sub ? '/' + sub : ''}”`]);
     if (Pasta.suportaSalvarComo) opcoes.push(['salvarcomo', 'Salvar como… (escolher o local)']);
     if (podeCompartilhar) opcoes.push(['compartilhar', 'Compartilhar… (Drive, e-mail…)']);
     opcoes.push(['baixar', 'Baixar (pasta Downloads)']);
@@ -301,15 +318,16 @@
     if (r.acao === 'pasta') {
       try {
         let destino = nome;
-        if (await Pasta.existe(pasta.handle, nome)) {
+        const dir = sub ? await pasta.handle.getDirectoryHandle(sub, { create: true }) : pasta.handle;
+        if (await Pasta.existe(dir, nome)) {
           const comData = nome.replace(/(\.[a-z]+)$/i, '-' + CC.todayISO() + '$1');
           const q = await dialogo(`<h2>Arquivo já existe</h2><p><b>${esc(nome)}</b> já está em “${esc(pasta.handle.name)}”. Se você ajustou essa planilha no Excel, substituir apaga os ajustes.</p>
             <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn" value="data">Salvar como ${esc(comData)}</button><button class="btn danger" value="subst">Substituir</button></div>`);
           if (!q.acao) return;
           if (q.acao === 'data') destino = comData;
         }
-        await Pasta.gravar(pasta.handle, destino, blob);
-        return toast(`Salvo em ${pasta.handle.name}/${destino}`);
+        await Pasta.gravar(dir, destino, blob);
+        return toast(`Salvo em ${pasta.handle.name}/${sub ? sub + '/' : ''}${destino}`);
       } catch (e) { return toast('Não consegui gravar na pasta: ' + e.message); }
     }
     if (r.acao === 'salvarcomo') {
@@ -364,14 +382,24 @@
     const partes = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
     window.scrollTo(0, 0);
     if (partes[0] === 'pessoas') return telaPessoas(decodeURIComponent(partes[1] || ''));
+    if (partes[0] === 'p') {
+      const p = projeto(partes[1]);
+      if (!p) return go('#/');
+      return partes[2] === 'calendario' ? telaCalendario(p) : telaProjeto(p);
+    }
+    if (partes[0] === 'd') {
+      const d = disciplina(partes[1]);
+      return d ? telaDisciplina(d) : go('#/');
+    }
     if (partes[0] !== 't') return telaTurmas();
     const t = turma(partes[1]);
     if (!t) return go('#/');
     const tela = partes[2] || 'chamada';
     const arg = partes[3];
     setTabs(t, tela === 'aluno' ? 'alunos' : tela);
+    const voltar = t.disciplinaId && (t.arquivada || contexto.disciplinaId === t.disciplinaId) ? '#/d/' + t.disciplinaId : '#/';
     setTopo(t.codigo ? (t.codigo + (t.turma ? ' ' + t.turma : '')) : t.disciplina,
-      (t.codigo ? CC.disciplinaTema(t) : t.periodo) + (t.arquivada ? ' · arquivada' : ''), '#/', () => menuTurma(t));
+      (t.codigo ? CC.disciplinaTema(t) : t.periodo) + (t.arquivada ? ' · arquivada' : ''), voltar, () => menuTurma(t));
     ({ chamada: telaChamada, alunos: telaAlunos, aluno: telaAluno, cronograma: telaCronograma, notas: telaNotas, resumo: telaResumo }[tela] || telaChamada)(t, arg);
   }
 
@@ -397,9 +425,648 @@
     desenhar();
   }
 
+  /* ---------- projetos e disciplinas ---------- */
+
+  // Última tela de projeto/disciplina visitada: turmas criadas a partir dali entram nela.
+  let contexto = { projetoId: null, disciplinaId: null };
+
+  function projeto(id) { return db.projetos.find(p => p.id === id); }
+  function disciplina(id) { return db.disciplinas.find(d => d.id === id); }
+  const ordemPeriodo = t => String(CC.chavePeriodo(t.periodo) || t.periodo || '');
+  const periodoDeHoje = () => (d => d.getFullYear() + '-' + (d.getMonth() < 7 ? '1' : '2'))(new Date());
+  const periodoAtualNum = () => periodoDeHoje().replace('-', '');
+  const turmasDoProjeto = p => db.turmas.filter(t => t.projetoId === p.id);
+
+  function maisComum(lista) {
+    const n = {};
+    lista.forEach(x => { n[x] = (n[x] || 0) + 1; });
+    return Object.keys(n).sort((a, b) => n[b] - n[a])[0] || '';
+  }
+
+  function resumoProjeto(p) {
+    const ts = turmasDoProjeto(p), ativas = ts.filter(t => !t.arquivada).length;
+    return `${CC.disciplinasDoProjeto(db, p).length} disciplina(s) · ${ts.length} turma(s)${ativas ? ` · ${ativas} ativa(s)` : ''}`;
+  }
+
+  function cartaoProjeto(p) {
+    return `<a class="card turma-card" href="#/p/${p.id}"><div class="muted small">${esc([p.instituicao, p.departamento].filter(Boolean).join(' · '))}</div>
+      <h2>${esc(p.nome)}</h2><div class="muted small">${resumoProjeto(p)}</div></a>`;
+  }
+
+  /** Regras do projeto (frequência e médias) numa turma nova. */
+  function herdarRegras(t, p) {
+    if (p) CC.REGRAS.forEach(k => { if (p.config[k] !== undefined) t.config[k] = p.config[k]; });
+  }
+
+  /** Disciplina recém-criada por uma turma: nome e nível pelas turmas/alunos. */
+  function ajustarSeNova(t) {
+    const d = CC.disciplinaDe(db, t);
+    if (d && CC.turmasDaDisciplina(db, d).length === 1) CC.ajustarDisciplina(db, d);
+  }
+
+  /** Campo "Projeto" (com a opção de criar um novo) para os diálogos de turma. Ligar com ligarProjeto. */
+  function campoProjeto(pid) {
+    const sel = [pid, contexto.projetoId, db.projetoPadrao].find(x => x && projeto(x)) || (db.projetos[0] ? db.projetos[0].id : 'novo');
+    return `<label class="field">Projeto<select name="projetoId" id="sel-projeto">
+      ${db.projetos.map(p => `<option value="${p.id}" ${p.id === sel ? 'selected' : ''}>${esc(p.nome)}</option>`).join('')}
+      <option value="novo" ${sel === 'novo' ? 'selected' : ''}>Novo projeto…</option></select></label>
+      <div class="row nowrap" id="novo-projeto" hidden><label class="field grow">Instituição<input type="text" name="instituicao" value="UFF"></label>
+      <label class="field grow">Departamento<input type="text" name="departamento" placeholder="opcional"></label></div>`;
+  }
+
+  function ligarProjeto(form) {
+    const s = form.querySelector('#sel-projeto'), box = form.querySelector('#novo-projeto');
+    if (!s || !box) return;
+    const sync = () => { box.hidden = s.value !== 'novo'; };
+    s.addEventListener('change', sync);
+    sync();
+  }
+
+  /** Projeto escolhido no diálogo (cria o novo, se for o caso). */
+  function projetoDoForm(d) {
+    const p = d.projetoId && d.projetoId !== 'novo' && projeto(d.projetoId);
+    if (p) return p;
+    const novo = CC.novoProjeto({ nome: d.projNome, instituicao: d.instituicao || 'UFF', departamento: d.departamento });
+    db.projetos.push(novo);
+    return novo;
+  }
+
+  /** Preenche início e fim das aulas pelo calendário letivo do projeto, quando o período tem calendário. */
+  function ligarCalendario(form) {
+    const per = form.querySelector('[name=periodo]'), sel = form.querySelector('#sel-projeto');
+    const ini = form.querySelector('[name=inicio]'), fim = form.querySelector('[name=fim]'), aviso = form.querySelector('#aviso-cal');
+    if (!per || !ini || !fim) return;
+    let preenchido = false;
+    const tentar = () => {
+      const p = sel && projeto(sel.value), k = CC.chavePeriodo(per.value);
+      const c = p && k ? p.calendario[k] : null;
+      if (aviso) aviso.textContent = c ? `Calendário letivo ${k}: ${resumoCalendario(c)}. Os dias sem aula entram no cronograma como "Sem aula".` : '';
+      if (!c) return;
+      if ((!ini.value || preenchido) && c.inicio) { ini.value = c.inicio; preenchido = true; }
+      if ((!fim.value || preenchido) && c.fim) fim.value = c.fim;
+    };
+    per.addEventListener('change', tentar);
+    if (sel) sel.addEventListener('change', tentar);
+    tentar();
+  }
+
+  /* ---------- tela: projeto ---------- */
+
+  function telaProjeto(p) {
+    contexto = { projetoId: p.id, disciplinaId: null };
+    setTabs(null);
+    setTopo(p.nome, [p.instituicao, p.departamento].filter(Boolean).join(' · ') || 'Projeto', '#/', () => menuProjeto(p));
+    const ds = CC.disciplinasDoProjeto(db, p).map(d => {
+      const ts = CC.turmasDaDisciplina(db, d).sort((x, y) => ordemPeriodo(x).localeCompare(ordemPeriodo(y)));
+      return { d, ts, ativas: ts.filter(t => !t.arquivada).length, ultimo: ts.length ? ordemPeriodo(ts[ts.length - 1]) : '' };
+    }).sort((x, y) => (y.ativas > 0) - (x.ativas > 0) || y.ultimo.localeCompare(x.ultimo) || CC.norm(x.d.nome).localeCompare(CC.norm(y.d.nome)));
+    app.innerHTML = `<a class="card turma-card" href="#/p/${p.id}/calendario"><b>Calendário letivo</b><div class="muted small">${esc(resumoCalendarioAtual(p))}</div></a>
+      ${ds.length > 6 ? `<div class="card"><input type="search" id="busca-disc" placeholder="Buscar disciplina (nome, código, sigla)" style="width:100%"></div>` : ''}
+      <h3 class="secao">Disciplinas</h3><div id="lista-disc"></div>
+      <button class="fab" id="imp">+ Importar planilha</button>`;
+    const desenhar = () => {
+      const b = $('#busca-disc'), q = CC.norm(b ? b.value : '');
+      const lista = ds.filter(x => !q || [x.d.nome, x.d.codigo, x.d.sigla, x.d.pasta].some(v => CC.norm(v).includes(q)));
+      $('#lista-disc').innerHTML = lista.length ? lista.map(({ d, ts, ativas }) => {
+        const pers = ts.map(t => CC.periodoCurto(t.periodo)).filter(Boolean);
+        const faixa = pers.length ? (pers[0] === pers[pers.length - 1] ? pers[0] : pers[0] + ' a ' + pers[pers.length - 1]) : '';
+        return `<a class="card turma-card" href="#/d/${d.id}"><div><span class="codigo">${esc(d.codigo || d.departamento || '')}</span> <span class="muted">${esc(d.sigla || '')}</span>${d.nivel !== 'grad' ? ` <span class="tag cat">${esc(CC.NIVEIS[d.nivel] || d.nivel)}</span>` : ''}</div>
+          <h2>${esc(d.nome || d.codigo || '?')}</h2>
+          <div class="muted small">${ts.length} turma(s)${faixa ? ' · ' + esc(faixa) : ''}${ativas ? ` · <b>${ativas} ativa(s)</b>` : ''}</div></a>`;
+      }).join('') : `<div class="card empty">${ds.length ? 'Nenhuma disciplina com esse nome.' : 'Nenhuma disciplina ainda. Importe uma planilha ou a pasta do projeto (menu ⋮).'}</div>`;
+    };
+    const b = $('#busca-disc'); if (b) b.addEventListener('input', desenhar);
+    desenhar();
+    $('#imp').onclick = importarNovaTurma;
+  }
+
+  function menuProjeto(p) {
+    dialogo(`<h2>${esc(p.nome)}</h2><ul class="menu-list">
+      <li><button value="editar">Editar projeto (instituição, regras)</button></li>
+      <li><button value="cal">Calendário letivo</button></li>
+      <li class="sep"></li>
+      <li><button value="pasta">Importar a pasta do projeto (todas as planilhas)</button></li>
+      <li><button value="importar">Importar planilha (nova turma)</button></li>
+      <li><button value="vazia">Criar turma vazia</button></li>
+      ${Pasta.suportada ? '<li><button value="gravar">Pasta onde salvar as planilhas do projeto</button></li>' : ''}
+      <li class="sep"></li>
+      <li><button value="excluir" style="color:var(--danger)">Excluir projeto</button></li></ul>`).then(r => {
+      if (r.acao === 'editar') editarProjeto(p);
+      if (r.acao === 'cal') go('#/p/' + p.id + '/calendario');
+      if (r.acao === 'pasta') importarPasta(p);
+      if (r.acao === 'importar') importarNovaTurma();
+      if (r.acao === 'vazia') criarTurmaVazia();
+      if (r.acao === 'gravar') configurarPasta(null, p);
+      if (r.acao === 'excluir') excluirProjeto(p);
+    });
+  }
+
+  async function editarProjeto(p) {
+    const novo = !p;
+    const c = Object.assign({}, CC.DEFAULT_CONFIG, p ? p.config : {});
+    const ativas = p ? turmasDoProjeto(p).filter(t => !t.arquivada).length : 0;
+    const r = await dialogo(`<h2>${novo ? 'Novo projeto' : 'Projeto'}</h2><div class="stack">
+      <label class="field">Nome<input type="text" name="nome" value="${esc(p ? p.nome : '')}" placeholder="ex.: UFF · Ciência da Computação"></label>
+      <div class="row nowrap"><label class="field grow">Instituição<input type="text" name="instituicao" value="${esc(p ? p.instituicao : 'UFF')}"></label>
+      <label class="field grow">Departamento / unidade<input type="text" name="departamento" value="${esc(p ? p.departamento : '')}" placeholder="opcional"></label></div>
+      <p class="muted small" style="margin-top:-6px">Na UFF, o curso e a forma de ingresso saem da matrícula.</p>
+      <fieldset class="grupo"><legend>Regras das turmas (padrão do projeto)</legend><div class="stack">
+      <div class="row nowrap">
+      <label class="field grow">Frequência mínima (%)<input type="number" min="0" max="100" name="freqMin" value="${c.freqMin}"></label>
+      <label class="field grow">Atraso vale (faltas)<input type="number" step="0.05" min="0" max="1" name="pesoAtraso" value="${c.pesoAtraso}"></label></div>
+      <div class="row nowrap">
+      <label class="field grow">Média mínima<input type="number" step="0.1" min="0" max="10" name="mediaMin" value="${c.mediaMin}"></label>
+      <label class="field grow">Faz VS a partir de<input type="number" step="0.1" min="0" max="10" name="mediaVS" value="${c.mediaVS}"></label>
+      <label class="field grow">Média mínima na pós<input type="number" step="0.1" min="0" max="10" name="mediaMinPos" value="${c.mediaMinPos == null ? '' : c.mediaMinPos}" placeholder="igual"></label></div>
+      ${ativas ? `<label class="checks"><label><input type="checkbox" name="aplicar"> aplicar também às ${ativas} turma(s) não arquivada(s)</label></label>` : ''}
+      <p class="muted small">As turmas novas do projeto começam com estas regras.</p>
+      </div></fieldset></div>
+      <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">${novo ? 'Criar' : 'Salvar'}</button></div>`);
+    if (r.acao !== 'ok') return null;
+    const d = r.dados;
+    if (novo) { p = CC.novoProjeto({ nome: d.nome, instituicao: d.instituicao, departamento: d.departamento }); db.projetos.push(p); }
+    else {
+      p.nome = String(d.nome || '').trim() || p.nome;
+      p.instituicao = String(d.instituicao || '').trim();
+      p.departamento = String(d.departamento || '').trim();
+    }
+    const num = v => { const x = parseFloat(String(v == null ? '' : v).replace(',', '.')); return isNaN(x) ? null : x; };
+    ['freqMin', 'pesoAtraso', 'mediaMin', 'mediaVS'].forEach(k => { const v = num(d[k]); if (v != null) p.config[k] = v; });
+    p.config.mediaMinPos = num(d.mediaMinPos);
+    CC.disciplinasDoProjeto(db, p).forEach(x => CC.sincronizarDisciplina(db, x));   // instituição nas turmas
+    if (d.aplicar) turmasDoProjeto(p).filter(t => !t.arquivada).forEach(t => herdarRegras(t, p));
+    db.projetoPadrao = p.id;
+    salvar();
+    if (novo) go('#/p/' + p.id); else render();
+    return p;
+  }
+
+  async function excluirProjeto(p) {
+    const n = turmasDoProjeto(p).length;
+    if (n) {
+      return dialogo(`<h2>Excluir projeto</h2><p>O projeto tem ${n} turma(s). Exclua as turmas ou mude o projeto delas (Configurações da turma → Projeto) antes.</p>
+        <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
+    }
+    if (!await confirmar('Excluir projeto', `Apagar o projeto <b>${esc(p.nome)}</b> e o calendário dele?`, 'Excluir', true)) return;
+    db.projetos = db.projetos.filter(x => x !== p);
+    db.disciplinas = db.disciplinas.filter(d => d.projetoId !== p.id);
+    if (db.projetoPadrao === p.id) delete db.projetoPadrao;
+    Pasta.esquecer('p:' + p.id).catch(() => {});
+    salvar(); go('#/');
+  }
+
+  /* ---------- tela: disciplina ---------- */
+
+  /** Resultado de uma turma (para a lista da disciplina). */
+  function resultadoTurma(t) {
+    const al = t.alunos.filter(a => a.ativo);
+    const dadas = t.aulas.filter(a => CC.aulaRealizada(t, a)).length;
+    if (!t.arquivada || !t.avaliacoes.length) return `${al.length} aluno(s) · ${dadas} aula(s) com chamada`;
+    let ap = 0, rep = 0;
+    al.forEach(a => {
+      const s = CC.statsAluno(t, a);
+      if (CC.reprovadoPorFalta(t, s.faltas) || s.sitNota.cod === 'BAIXA') rep++;
+      else if (s.sitNota.cod === 'OK') ap++;
+    });
+    return `${al.length} aluno(s) · ${ap} aprovado(s) · ${rep} reprovado(s)`;
+  }
+
+  function telaDisciplina(d) {
+    const p = projeto(d.projetoId);
+    contexto = { projetoId: d.projetoId, disciplinaId: d.id };
+    setTabs(null);
+    setTopo([d.codigo || d.departamento, d.sigla].filter(Boolean).join(' · ') || d.nome, d.nome, p ? '#/p/' + p.id : '#/', () => menuDisciplina(d));
+    const ts = CC.turmasDaDisciplina(db, d).sort((x, y) => ordemPeriodo(y).localeCompare(ordemPeriodo(x)) || String(x.turma).localeCompare(String(y.turma)));
+    const c = d.config || {};
+    const info = [c.cargaHoraria ? c.cargaHoraria + ' h' : '', c.horasAula ? c.horasAula + ' h por aula' : '', (c.categorias || []).length ? 'aulas: ' + c.categorias.join(', ') : ''].filter(Boolean);
+    let h = `<div class="card"><div class="row nowrap"><div class="grow">
+      <div class="small">${esc(CC.NIVEIS[d.nivel] || 'Graduação')}${d.semAvulsos ? ' · não aceita alunos avulsos' : ''}</div>
+      ${info.length ? `<div class="muted small">${esc(info.join(' · '))}</div>` : ''}
+      <div class="muted small">${esc(p ? p.nome : '')}${d.pasta ? ' · pasta ' + esc(d.pasta) : ''}</div></div>
+      <button class="btn small" id="editar-disc">Editar</button></div></div>
+      <h3 class="secao">Turmas (${ts.length})</h3>`;
+    h += ts.map(t => `<a class="card turma-card ${t.arquivada ? 'arquivada' : ''}" href="#/t/${t.id}/chamada">
+      <div><span class="codigo">${esc(CC.periodoCurto(t.periodo) || '?')}</span> <span class="muted">${esc(t.turma || '')}</span>${t.arquivada ? '' : ' <span class="tag OK">ativa</span>'}</div>
+      ${t.tema ? `<div class="small">${esc(t.tema)}</div>` : ''}
+      <div class="muted small">${resultadoTurma(t)}</div></a>`).join('');
+    h += `<button class="fab" id="nova">+ Nova turma</button>`;
+    app.innerHTML = h;
+    $('#editar-disc').onclick = () => editarDisciplina(d);
+    $('#nova').onclick = () => criarTurmaVazia(d);
+  }
+
+  function menuDisciplina(d) {
+    dialogo(`<h2>${esc(d.nome)}</h2><ul class="menu-list">
+      <li><button value="editar">Editar disciplina</button></li>
+      <li><button value="nova">Nova turma desta disciplina</button></li>
+      <li><button value="importar">Importar planilha (nova turma)</button></li></ul>`).then(r => {
+      if (r.acao === 'editar') editarDisciplina(d);
+      if (r.acao === 'nova') criarTurmaVazia(d);
+      if (r.acao === 'importar') importarNovaTurma();
+    });
+  }
+
+  async function editarDisciplina(d) {
+    const c = d.config || {};
+    const ativas = CC.turmasDaDisciplina(db, d).filter(t => !t.arquivada).length;
+    const r = await dialogo(`<h2>Disciplina</h2><div class="stack">
+      <label class="field">Nome<input type="text" name="nome" value="${esc(d.nome)}" required></label>
+      <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(d.codigo)}"></label>
+      <label class="field grow">Sigla (nomes de arquivo)<input type="text" name="sigla" value="${esc(d.sigla)}" placeholder="${esc(CC.siglaDisciplina(d.nome))}"></label></div>
+      <label class="field">Nível<select name="nivel">${Object.keys(CC.NIVEIS).map(k => `<option value="${k}" ${d.nivel === k ? 'selected' : ''}>${CC.NIVEIS[k]}</option>`).join('')}</select></label>
+      <div class="checks"><label><input type="checkbox" name="semAvulsos" ${d.semAvulsos ? 'checked' : ''}> não aceita alunos avulsos (ex.: "Tópicos especiais…")</label></div>
+      <p class="muted small" style="margin-top:-4px">Na pós não há VS e vale a média mínima da pós (regras do projeto).</p>
+      ${db.projetos.length > 1 ? `<label class="field">Projeto<select name="projetoId">${db.projetos.map(p => `<option value="${p.id}" ${p.id === d.projetoId ? 'selected' : ''}>${esc(p.nome)}</option>`).join('')}</select></label>` : ''}
+      <fieldset class="grupo"><legend>Padrão das turmas novas</legend><div class="stack">
+      <div class="row nowrap"><label class="field grow">Carga horária (h)<input type="number" min="0" name="cargaHoraria" list="cargas" value="${c.cargaHoraria || ''}"></label>
+      <label class="field grow">Horas por aula<input type="number" min="0" step="0.5" name="horasAula" value="${c.horasAula || ''}"></label></div>
+      <datalist id="cargas"><option value="60"><option value="64"><option value="68"></datalist>
+      <label class="field">Tipos de aula (separados por vírgula)<input type="text" name="categorias" value="${esc((c.categorias || []).join(', '))}" placeholder="ex.: Teórica, Laboratório"></label>
+      ${ativas ? `<label class="checks"><label><input type="checkbox" name="aplicar"> aplicar carga horária e tipos de aula às ${ativas} turma(s) não arquivada(s)</label></label>` : ''}
+      </div></fieldset>
+      <p class="muted small">Nome, código, sigla e nível valem para todas as turmas da disciplina.</p></div>
+      <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
+    if (r.acao !== 'ok') return;
+    const x = r.dados;
+    d.nome = String(x.nome || '').trim() || d.nome;
+    d.codigo = String(x.codigo || '').trim();
+    d.sigla = String(x.sigla || '').trim();
+    if (x.nivel && x.nivel !== d.nivel) d.nivelFixo = true;
+    d.nivel = x.nivel || 'grad';
+    d.semAvulsos = !!x.semAvulsos;
+    if (x.projetoId && projeto(x.projetoId)) d.projetoId = x.projetoId;
+    const num = v => { const n = parseFloat(String(v == null ? '' : v).replace(',', '.')); return isNaN(n) || n <= 0 ? null : n; };
+    d.config = {};
+    if (num(x.cargaHoraria)) d.config.cargaHoraria = num(x.cargaHoraria);
+    if (num(x.horasAula)) d.config.horasAula = num(x.horasAula);
+    const cats = lerCategorias(x.categorias);
+    if (cats.length) d.config.categorias = cats;
+    CC.sincronizarDisciplina(db, d);
+    if (x.aplicar) CC.turmasDaDisciplina(db, d).filter(t => !t.arquivada).forEach(t => {
+      ['cargaHoraria', 'horasAula'].forEach(k => { if (d.config[k]) t.config[k] = d.config[k]; });
+      if (cats.length) { t.config.categorias = cats.slice(); CC.aplicarCategorias(t); }
+    });
+    salvar(); render();
+  }
+
+  /* ---------- importar a pasta do projeto ---------- */
+
+  const EXTS_PLANILHA = ['.xls', '.xlsx', '.ods'];
+
+  /** Seletor de pasta do sistema (onde não há showDirectoryPicker): devolve os arquivos com o caminho relativo. */
+  function escolherPastaDoSistema() {
+    const input = $('#file-input');
+    input.value = '';
+    input.accept = '';
+    input.multiple = true;
+    input.webkitdirectory = true;
+    return new Promise(resolve => {
+      input.onchange = () => { const fs = Array.from(input.files); input.webkitdirectory = false; resolve(fs); };
+      input.click();
+    });
+  }
+
+  /** Cria uma turma para cada planilha lida e põe no projeto/disciplina. itens: [{ f, p, pasta? }]. Devolve as disciplinas novas. */
+  function criarTurmasDePlanilhas(itens, proj, arquivar) {
+    const atual = periodoAtualNum();
+    const novas = new Set();
+    itens.forEach(i => {
+      const cfg = i.p.configuracao || {};
+      const t = CC.turmaDePlanilha(i.p, { instituicao: proj ? proj.instituicao : (db.instituicao || 'UFF'), dataLista: dataDoArquivo(i.f) });
+      if (arquivar && t.periodo && String(t.periodo) < atual) t.arquivada = CC.todayISO();
+      db.turmas.push(t);
+      const n0 = db.disciplinas.length;
+      const r = CC.vincularTurma(db, t, {
+        projetoId: proj && proj.id, pasta: i.pasta ? i.pasta.nome : '', sigla: (i.pasta && i.pasta.sigla) || cfg.sigla,
+        departamento: (i.pasta && i.pasta.departamento) || cfg.departamento, nivel: cfg.nivel
+      });
+      if (db.disciplinas.length > n0) novas.add(r.d);
+    });
+    novas.forEach(d => CC.ajustarDisciplina(db, d));
+    return novas;
+  }
+
+  /**
+   * Importa todas as planilhas de uma pasta (e subpastas): cada subpasta no padrão "UFF-código-sigla"
+   * vira uma disciplina, cada planilha uma turma. teste = { nomePasta, entradas, handle } (para depurar).
+   */
+  async function importarPasta(proj, teste) {
+    let nomePasta = '', entradas = [], handle = null;
+    if (teste) ({ nomePasta, entradas, handle } = teste);
+    else if (Pasta.suportada) {
+      const inicio = Date.now();
+      try { handle = await window.showDirectoryPicker({ id: 'chamada-projeto', mode: 'read', startIn: 'documents' }); }
+      catch (e) { seletorFalhou(e, inicio, 'a lista de pastas'); return; }
+      nomePasta = handle.name;
+      toast('Procurando planilhas em ' + nomePasta + '…');
+      try { entradas = await Pasta.arquivos(handle, EXTS_PLANILHA, 3); } catch (e) { return toast('Não consegui ler a pasta: ' + e.message); }
+    } else {
+      const files = await escolherPastaDoSistema();
+      if (!files.length) return;
+      nomePasta = (files[0].webkitRelativePath || '').split('/')[0] || 'pasta';
+      entradas = files.filter(f => EXTS_PLANILHA.some(x => f.name.toLowerCase().endsWith(x)) && !f.name.startsWith('~$'))
+        .map(f => f.webkitRelativePath ? { file: f, caminho: f.webkitRelativePath.split('/').slice(1) }
+          : { file: f, caminho: [f.name], semPasta: true });   // navegador que não escolhe pasta: vieram só arquivos
+    }
+    if (!entradas.length) return toast('Nenhuma planilha (.xls, .xlsx, .ods) nessa pasta.');
+    if (semXLSX()) return;
+
+    dialogo(`<h2>Lendo planilhas…</h2><progress id="prog-pasta" max="${entradas.length}" value="0" style="width:100%"></progress>
+      <p class="muted small" id="prog-txt"></p>`);
+    const itens = [];
+    for (let k = 0; k < entradas.length; k++) {
+      const e = entradas[k];
+      const pg = $('#prog-pasta');
+      if (pg) { pg.value = k; $('#prog-txt').textContent = `${k + 1} de ${entradas.length}: ${e.caminho.join('/')}`; }
+      let p = null;
+      try { p = await lerPlanilha(e.file); } catch (err) { /* ilegível ou com senha */ }
+      const dir = e.caminho.length > 1 ? e.caminho[e.caminho.length - 2] : '';
+      const info = dir ? CC.lerNomePasta(dir) : null;
+      itens.push({ f: e.file, caminho: e.caminho.join('/'), p, raiz: e.caminho.length === 1 && !e.semPasta, pasta: info ? Object.assign({ nome: dir }, info) : null });
+      await new Promise(ok => setTimeout(ok, 0));   // deixa a barra andar
+    }
+    const chaveDe = (cod, disc, tur, per, tema) => [cod || CC.norm(disc), tur, per, tema || ''].join('|');
+    const existentes = new Set(db.turmas.map(t => chaveDe(t.codigo, t.disciplina, t.turma, t.periodo, t.tema)));
+    const vistas = new Set();
+    itens.forEach(i => {
+      if (!i.p) return;
+      const m = i.p.meta, cfg = i.p.configuracao || {};
+      i.chave = chaveDe(m.codigo, m.disciplina, m.turma, m.periodo, cfg.tema);
+      i.existe = existentes.has(i.chave) || vistas.has(i.chave);
+      vistas.add(i.chave);
+      i.ok = i.p.alunos.length > 0 && !i.existe;
+    });
+    const lin = i => !i.p ? 'não abriu (com senha ou corrompida?)' : !i.p.alunos.length ? 'sem alunos reconhecidos' : i.existe ? 'turma já existe'
+      : `${[CC.periodoCurto(i.p.meta.periodo), i.p.meta.turma].filter(Boolean).join(' · ')} · ${i.p.alunos.length} alunos`;
+    const inst = maisComum(itens.map(i => i.pasta && i.pasta.instituicao).filter(Boolean)) || 'UFF';
+    const deptos = Array.from(new Set(itens.map(i => i.pasta && i.pasta.departamento).filter(Boolean)));
+    const projSel = proj ? proj.id : ((db.projetos.find(p => CC.norm(p.nome) === CC.norm(nomePasta)) || {}).id || 'novo');
+    const nPastas = new Set(itens.map(i => i.pasta && i.pasta.nome).filter(Boolean)).size;
+    const marcadas = itens.filter(i => i.ok && !i.raiz).length;
+    const r = await dialogo(`<h2>Importar “${esc(nomePasta)}”</h2>
+      <p class="muted small">${itens.length} planilha(s)${nPastas ? ` em ${nPastas} pasta(s) de disciplina` : ''}. Cada pasta no padrão <b>UFF-código-sigla</b> vira uma disciplina; cada planilha, uma turma.</p>
+      <label class="field">Projeto<select name="projetoId" id="sel-projeto">${db.projetos.map(p => `<option value="${p.id}" ${p.id === projSel ? 'selected' : ''}>${esc(p.nome)}</option>`).join('')}
+        <option value="novo" ${projSel === 'novo' ? 'selected' : ''}>Novo projeto: ${esc(nomePasta)}</option></select></label>
+      <div class="row nowrap" id="novo-projeto"><label class="field grow">Instituição<input type="text" name="instituicao" value="${esc(inst)}"></label>
+      <label class="field grow">Departamento<input type="text" name="departamento" value="${esc(deptos.length === 1 ? deptos[0] : '')}" placeholder="${esc(deptos.join(', ') || 'opcional')}"></label></div>
+      <input type="hidden" name="projNome" value="${esc(nomePasta)}">
+      <div class="checks"><label><input type="checkbox" name="arquivar" checked> arquivar as turmas de períodos anteriores ao atual</label>
+      ${handle && Pasta.suportada ? '<label><input type="checkbox" name="guardar" checked> salvar nesta pasta as planilhas exportadas das turmas do projeto (cada uma na pasta da sua disciplina)</label>' : ''}</div>
+      <details class="small"><summary><b id="conta-sel">${marcadas}</b> de ${itens.length} planilha(s) selecionada(s)</summary>
+      <div class="scroll checks">${itens.map((i, k) => `<label><input type="checkbox" name="arq" value="${k}" ${i.ok && !i.raiz ? 'checked' : ''} ${i.ok ? '' : 'disabled'}> ${esc(i.caminho)} <span class="muted">— ${esc(lin(i))}</span></label>`).join('')}</div></details>
+      <p class="muted small">Planilhas soltas na raiz da pasta (como um resumo) vêm desmarcadas.</p>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Importar</button></div>`,
+    form => {
+      ligarProjeto(form);
+      form.addEventListener('change', () => { form.querySelector('#conta-sel').textContent = form.querySelectorAll('[name=arq]:checked').length; });
+    });
+    if (r.acao !== 'ok') return;
+    const sel = [].concat(r.dados.arq || []).map(Number).map(k => itens[k]).filter(i => i && i.ok);
+    if (!sel.length) return toast('Nenhuma planilha selecionada.');
+    const p = projetoDoForm(r.dados);
+    const novas = criarTurmasDePlanilhas(sel, p, !!r.dados.arquivar);
+    if (handle && r.dados.guardar) { try { await Pasta.guardar('p:' + p.id, handle); } catch (e) { /* fica sem a pasta */ } }
+    db.projetoPadrao = p.id;
+    salvar(); go('#/p/' + p.id);
+    toast(`${sel.length} turma(s) importada(s) · ${novas.size} disciplina(s) nova(s)`);
+  }
+
+  /* ---------- calendário letivo ---------- */
+
+  function resumoCalendario(c) {
+    const sa = (c.eventos || []).filter(e => e.semAula).length, av = (c.eventos || []).length - sa;
+    return [c.inicio && c.fim ? CC.fmtDate(c.inicio) + ' a ' + CC.fmtDate(c.fim) : c.inicio ? 'início ' + CC.fmtDate(c.inicio) : 'sem início/fim',
+      sa + ' dia(s) ou intervalo(s) sem aula', av ? av + ' aviso(s)' : ''].filter(Boolean).join(' · ');
+  }
+
+  function resumoCalendarioAtual(p) {
+    const ks = Object.keys(p.calendario || {}).sort();
+    if (!ks.length) return 'Não preenchido: leia o PDF da universidade, digite ou deduza dos cronogramas das turmas.';
+    const hoje = CC.todayISO();
+    const k = ks.find(x => { const c = p.calendario[x]; return c.inicio && c.fim && hoje >= c.inicio && hoje <= c.fim; }) ||
+      (ks.includes(periodoDeHoje()) ? periodoDeHoje() : ks[ks.length - 1]);
+    return k + ': ' + resumoCalendario(p.calendario[k]) + (ks.length > 1 ? ` · ${ks.length} períodos` : '');
+  }
+
+  /** Aulas ainda sem chamada que caem em dia sem aula do calendário. */
+  function feriadosPendentes(t, c) {
+    return t.aulas.filter(a => a.tipo !== 'sem-aula' && !CC.aulaRealizada(t, a) && CC.semAulaEm(c, a.data)).length;
+  }
+
+  const turmasDoPeriodo = (p, k) => turmasDoProjeto(p).filter(t => CC.chavePeriodo(t.periodo) === k);
+
+  function aplicarCalendarioPeriodo(p, k) {
+    const c = p.calendario[k];
+    let n = 0;
+    turmasDoPeriodo(p, k).forEach(t => {
+      n += CC.aplicarCalendario(t, c);
+      if (!t.config.inicio && c.inicio) t.config.inicio = c.inicio;
+      if (!t.config.fim && c.fim) t.config.fim = c.fim;
+    });
+    salvar(); render();
+    toast(n + ' aula(s) marcada(s) como "Sem aula"');
+  }
+
+  async function oferecerAplicar(p, k) {
+    const c = p.calendario[k];
+    const n = turmasDoPeriodo(p, k).reduce((s, t) => s + feriadosPendentes(t, c), 0);
+    if (!n) return;
+    if (await confirmar('Aplicar às turmas', `${n} aula(s) ainda sem chamada caem em dias sem aula nas turmas de ${esc(k)}. Marcar como "Sem aula"?`, 'Marcar')) aplicarCalendarioPeriodo(p, k);
+  }
+
+  function telaCalendario(p) {
+    contexto = { projetoId: p.id, disciplinaId: null };
+    setTabs(null);
+    setTopo('Calendário letivo', p.nome, '#/p/' + p.id, () => menuProjeto(p));
+    const ks = Object.keys(p.calendario).sort().reverse();
+    let h = `<div class="card"><p class="small" style="margin-top:0">Início e fim das aulas, feriados e recessos de cada período. Ao gerar o cronograma de uma turma, os dias sem aula entram como "Sem aula".</p>
+      <div class="row"><button class="btn small" id="cal-pdf">Ler PDF do calendário…</button><button class="btn small" id="cal-deduzir">Deduzir dos cronogramas</button>
+      <button class="btn small primary" id="cal-novo">+ Período</button></div></div>`;
+    h += ks.length ? ks.map(k => {
+      const c = p.calendario[k], ts = turmasDoPeriodo(p, k);
+      const pend = ts.reduce((n, t) => n + feriadosPendentes(t, c), 0);
+      const ev = CC.ordenarEventos(c.eventos);
+      return `<div class="card"><div class="row nowrap"><div class="grow"><h3>${esc(k)}</h3>
+        <div class="muted small">${esc(resumoCalendario(c))}${ts.length ? ` · ${ts.length} turma(s)` : ''}</div></div>
+        <button class="btn small" data-editar="${esc(k)}">Editar</button></div>
+        ${ev.length ? `<ul class="small eventos">${ev.map(e => `<li class="${e.semAula ? '' : 'muted'}">${esc(CC.fmtDate(e.data))}${e.ate ? ' a ' + esc(CC.fmtDate(e.ate)) : ''} — ${esc(e.descricao)}${e.semAula ? '' : ' (aviso)'}</li>`).join('')}</ul>` : ''}
+        ${pend ? `<button class="btn small" data-aplicar="${esc(k)}">Marcar ${pend} aula(s) como "Sem aula" nas turmas</button>` : ''}</div>`;
+    }).join('') : '<div class="card empty">Nenhum período ainda.</div>';
+    app.innerHTML = h;
+    $('#cal-pdf').onclick = () => lerCalendarioPDF(p);
+    $('#cal-deduzir').onclick = () => deduzirCalendario(p);
+    $('#cal-novo').onclick = () => editarPeriodoCal(p, null);
+    app.querySelectorAll('[data-editar]').forEach(b => b.onclick = () => editarPeriodoCal(p, b.dataset.editar));
+    app.querySelectorAll('[data-aplicar]').forEach(b => b.onclick = () => aplicarCalendarioPeriodo(p, b.dataset.aplicar));
+  }
+
+  /** Feriados locais usados pelo botão "+ Feriados": RJ, Niterói e o Dia do Professor (feriado escolar na UFF). */
+  function locaisDe(p) {
+    const uff = CC.ehUFF(p);
+    return Object.assign({ rj: uff, niteroi: uff, professor: uff }, p.feriadosLocais);
+  }
+
+  async function editarPeriodoCal(p, k) {
+    const c = (k && p.calendario[k]) || { inicio: '', fim: '', eventos: [] };
+    const loc = locaisDe(p);
+    const r = await dialogo(`<h2>${k ? 'Período ' + esc(k) : 'Novo período'}</h2><div class="stack">
+      <label class="field">Período<input type="text" name="periodo" value="${esc(k || periodoDeHoje())}" placeholder="ex.: 2026-2" required></label>
+      <div class="row nowrap"><label class="field grow">Início das aulas<input type="date" name="inicio" value="${c.inicio || ''}"></label>
+      <label class="field grow">Fim<input type="date" name="fim" value="${c.fim || ''}"></label></div>
+      <label class="field">Dias sem aula e avisos (um por linha)<textarea name="eventos" rows="10" style="font-family:monospace;font-size:14px" placeholder="07/09/2026 Independência do Brasil&#10;13/10/2026 a 17/10/2026 Semana acadêmica&#10;* 15/12/2026 Prazo para lançar as notas">${esc(CC.eventosParaTexto(c.eventos))}</textarea></label>
+      <p class="muted small" style="margin-top:-6px">Formato: <b>dd/mm</b> ou <b>dd/mm a dd/mm</b> (ano opcional) e a descrição. Linha começando com <b>*</b> é só aviso: não cancela aula.
+        "+ Feriados" põe a previsão; a lista oficial da UFF sai numa resolução no começo do ano (leia o PDF dela em "Ler PDF").</p>
+      <div class="row"><button type="button" class="btn small" id="add-feriados">+ Feriados</button>
+        <label class="small"><input type="checkbox" name="ferRJ" ${loc.rj ? 'checked' : ''}> do RJ</label>
+        <label class="small"><input type="checkbox" name="ferNit" ${loc.niteroi ? 'checked' : ''}> de Niterói</label>
+        <label class="small"><input type="checkbox" name="ferProf" ${loc.professor ? 'checked' : ''}> Dia do Professor (UFF)</label>
+        <button type="button" class="btn small" id="add-turmas">+ Dos cronogramas</button></div>
+      <p class="small" id="cal-msg"></p></div>
+      <div class="acoes">${k ? '<button class="btn danger" value="excluir" formnovalidate>Excluir</button>' : ''}<button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`,
+    form => {
+      const ta = form.querySelector('[name=eventos]'), msg = form.querySelector('#cal-msg');
+      const val = n => form.querySelector(`[name=${n}]`).value;
+      const juntar = (novos, rot) => {
+        const atuais = CC.textoParaEventos(ta.value, val('inicio')).eventos;
+        const todos = CC.juntarEventos(atuais, novos);
+        msg.textContent = `${todos.length - atuais.length} ${rot} acrescentado(s).`;
+        ta.value = CC.eventosParaTexto(todos);
+      };
+      form.querySelector('#add-feriados').onclick = () => {
+        if (!val('inicio') || !val('fim')) { msg.textContent = 'Preencha antes o início e o fim das aulas.'; return; }
+        const marcado = n => form.querySelector(`[name=${n}]`).checked;
+        juntar(CC.feriadosEntre(val('inicio'), val('fim'), { rj: marcado('ferRJ'), niteroi: marcado('ferNit'), professor: marcado('ferProf') }), 'feriado(s)');
+      };
+      form.querySelector('#add-turmas').onclick = () => {
+        const kk = CC.chavePeriodo(val('periodo'));
+        const d = CC.calendarioDasTurmas(turmasDoProjeto(p))[kk];
+        if (!d) { msg.textContent = 'Nenhuma turma deste projeto tem cronograma em ' + (kk || 'esse período') + '.'; return; }
+        if (!val('inicio')) form.querySelector('[name=inicio]').value = d.inicio;
+        if (!val('fim')) form.querySelector('[name=fim]').value = d.fim;
+        juntar(d.eventos, 'dia(s) sem aula');
+      };
+    });
+    if (r.acao === 'excluir') {
+      if (await confirmar('Excluir período', `Apagar o calendário de ${esc(k)}? As turmas não mudam.`, 'Excluir', true)) { delete p.calendario[k]; salvar(); render(); }
+      return;
+    }
+    if (r.acao !== 'ok') return;
+    const nk = CC.chavePeriodo(r.dados.periodo);
+    if (!nk) return toast('Período inválido: use o formato 2026-2');
+    p.feriadosLocais = { rj: !!r.dados.ferRJ, niteroi: !!r.dados.ferNit, professor: !!r.dados.ferProf };
+    const lido = CC.textoParaEventos(r.dados.eventos, r.dados.inicio);
+    if (lido.erros.length && !await confirmar('Linhas não entendidas', `Estas linhas serão ignoradas:<br>${lido.erros.map(esc).join('<br>')}`, 'Salvar assim')) return;
+    if (k && k !== nk) delete p.calendario[k];
+    p.calendario[nk] = { inicio: r.dados.inicio || '', fim: r.dados.fim || '', eventos: lido.eventos };
+    salvar(); render();
+    await oferecerAplicar(p, nk);
+  }
+
+  async function deduzirCalendario(p) {
+    const d = CC.calendarioDasTurmas(turmasDoProjeto(p));
+    const ks = Object.keys(d).sort();
+    if (!ks.length) return toast('Nenhuma turma do projeto tem cronograma.');
+    const ok = await confirmar('Deduzir dos cronogramas', `${ks.length} período(s) (${esc(ks[0])}${ks.length > 1 ? ' a ' + esc(ks[ks.length - 1]) : ''}).
+      Início e fim = primeira e última aula das turmas; as aulas marcadas "Sem aula" viram dias sem aula. O que já está no calendário é mantido.`, 'Deduzir');
+    if (!ok) return;
+    let novos = 0;
+    ks.forEach(k => {
+      const atual = p.calendario[k];
+      if (!atual) { p.calendario[k] = d[k]; novos++; return; }
+      if (!atual.inicio) atual.inicio = d[k].inicio;
+      if (!atual.fim) atual.fim = d[k].fim;
+      atual.eventos = CC.juntarEventos(atual.eventos, d[k].eventos);
+    });
+    salvar(); render();
+    toast(`${ks.length} período(s) deduzido(s), ${novos} novo(s). Confira as datas.`);
+  }
+
+  const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+  function carregarPdfJs() {
+    if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+    return new Promise((ok, erro) => {
+      const s = document.createElement('script');
+      s.src = PDFJS + 'pdf.min.js'; s.crossOrigin = 'anonymous';
+      s.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js'; ok(window.pdfjsLib); };
+      s.onerror = () => { s.remove(); erro(new Error('não consegui baixar o leitor de PDF (é preciso internet na primeira vez)')); };
+      document.head.appendChild(s);
+    });
+  }
+
+  /** Texto do PDF, uma string por linha (itens agrupados pela altura na página). */
+  async function linhasDoPDF(file) {
+    const lib = await carregarPdfJs();
+    const pdf = await lib.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const linhas = [];
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const tc = await (await pdf.getPage(i)).getTextContent();
+      const grupos = [];
+      tc.items.forEach(it => {
+        if (!it.str || !it.str.trim()) return;
+        const y = it.transform[5];
+        let gr = grupos.find(x => Math.abs(x.y - y) < 3);
+        if (!gr) { gr = { y, itens: [] }; grupos.push(gr); }
+        gr.itens.push({ x: it.transform[4], s: it.str });
+      });
+      grupos.sort((a, b) => b.y - a.y).forEach(gr => linhas.push(gr.itens.sort((a, b) => a.x - b.x).map(x => x.s).join(' ')));
+    }
+    return linhas;
+  }
+
+  async function lerCalendarioPDF(p, arquivo) {
+    const file = arquivo || await escolherDoSistema('.pdf,application/pdf');
+    if (!file) return;
+    toast('Lendo o PDF…');
+    let linhas;
+    try { linhas = await linhasDoPDF(file); } catch (e) { return toast('Não consegui ler o PDF: ' + e.message); }
+    const lido = CC.calendarioDoTexto(linhas);
+    const loc = locaisDe(p);
+    // Resolução de feriados e pontos facultativos (sai separada, no começo do ano): vai para os períodos do ano.
+    const fer = CC.feriadosDoTexto(linhas, loc.niteroi ? 'Niterói' : (loc.municipio || ''));
+    if (fer) {
+      fer.eventos.forEach(e => {
+        const k = Object.keys(lido).concat(Object.keys(p.calendario)).find(x => {
+          const c = lido[x] || p.calendario[x];
+          return c.inicio && c.fim && e.data >= c.inicio && e.data <= c.fim;
+        });
+        const chave = k || (CC.chavePeriodo(e.data.slice(0, 4) + '-' + (+e.data.slice(5, 7) <= 7 ? 1 : 2)));
+        const c = lido[chave] || (lido[chave] = Object.assign({ inicio: '', fim: '' }, p.calendario[chave] ? { inicio: p.calendario[chave].inicio, fim: p.calendario[chave].fim } : {}, { eventos: [] }));
+        if (c.inicio && c.fim && (e.data > c.fim || (e.ate || e.data) < c.inicio)) return;   // fora das aulas
+        c.eventos.push(e);
+      });
+    }
+    const ks = Object.keys(lido).sort();
+    if (!ks.length) {
+      return dialogo(`<h2>Calendário não reconhecido</h2><p>${linhas.join('').trim() ? 'Não encontrei nesse PDF as datas dos períodos letivos nem feriados.' : 'O PDF não tem texto (parece uma imagem escaneada).'}
+        Preencha à mão em <b>+ Período</b>: início, fim e os feriados (o botão "+ Feriados" acrescenta os nacionais).</p>
+        <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
+    }
+    const r = await dialogo(`<h2>${fer ? 'Feriados lidos do PDF' : 'Calendário lido do PDF'}</h2>
+      <p class="muted small">${esc(file.name)}. A leitura é automática: confira e corrija antes de salvar. Linha com * é só aviso (não cancela aula).
+      ${fer ? `Feriados e pontos facultativos de ${fer.ano}${loc.niteroi ? ' (municipais: só os de Niterói)' : ''}, nos períodos em que caem.` : ''}</p>
+      ${ks.map(k => { const c = lido[k]; return `<fieldset class="grupo"><legend><label><input type="checkbox" name="usar" value="${k}" checked> ${k}</label></legend><div class="stack">
+        <div class="row nowrap"><label class="field grow">Início<input type="date" name="ini_${k}" value="${c.inicio}"></label><label class="field grow">Fim<input type="date" name="fim_${k}" value="${c.fim}"></label></div>
+        <textarea name="ev_${k}" rows="6" style="font-family:monospace;font-size:13px">${esc(CC.eventosParaTexto(c.eventos))}</textarea></div></fieldset>`; }).join('')}
+      ${fer ? '' : `<div class="checks"><label><input type="checkbox" name="feriados" checked> acrescentar a previsão dos feriados (nacionais${loc.rj ? ', do RJ' : ''}${loc.niteroi ? ', de Niterói' : ''}${loc.professor ? ', Dia do Professor' : ''}); a lista oficial da UFF sai numa resolução à parte</label></div>`}
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`);
+    if (r.acao !== 'ok') return;
+    const usar = [].concat(r.dados.usar || []);
+    usar.forEach(k => {
+      const ini = r.dados['ini_' + k] || '', fim = r.dados['fim_' + k] || '';
+      let ev = CC.textoParaEventos(r.dados['ev_' + k], ini).eventos;
+      if (r.dados.feriados && ini && fim) ev = CC.juntarEventos(ev, CC.feriadosEntre(ini, fim, loc));
+      const atual = p.calendario[k] || { inicio: '', fim: '', eventos: [] };
+      p.calendario[k] = { inicio: ini || atual.inicio, fim: fim || atual.fim, eventos: CC.juntarEventos(atual.eventos, ev) };
+    });
+    salvar(); render();
+    toast(usar.length + ' período(s) salvo(s) no calendário');
+    for (const k of usar) await oferecerAplicar(p, k);
+  }
+
   /* ---------- tela: turmas ---------- */
 
   function telaTurmas() {
+    contexto = { projetoId: null, disciplinaId: null };
     setTabs(null);
     setTopo('Chamada', 'Suas turmas', null, menuGeral);
     if (aguardandoIDB) { app.innerHTML = '<div class="card empty">Carregando…</div>'; return; }
@@ -408,6 +1075,7 @@
         <p><strong>Nenhuma turma ainda.</strong></p>
         <p>Importe a lista de alunos exportada do sistema (.xls ou .xlsx) — ou uma planilha de chamada antiga — para criar a primeira turma.</p>
         <div class="stack"><button class="btn primary block" id="imp">Importar planilha</button>
+        <button class="btn block" id="pasta">Importar a pasta de um projeto (várias turmas)</button>
         <button class="btn block" id="nova">Criar turma vazia</button>
         <button class="btn block" id="restaurar">Restaurar backup</button></div></div>`;
     } else {
@@ -421,6 +1089,7 @@
       };
       const ativas = db.turmas.filter(t => !t.arquivada), arquivadas = db.turmas.filter(t => t.arquivada);
       app.innerHTML = (ativas.length ? ativas.map(cartao).join('') : '<div class="card empty">Nenhuma turma ativa.</div>') +
+        (db.projetos.length ? '<h3 class="secao">Projetos</h3>' + db.projetos.map(cartaoProjeto).join('') : '') +
         (arquivadas.length ? `<details class="arquivo"><summary>Turmas arquivadas (${arquivadas.length})</summary>${arquivadas.map(cartao).join('')}</details>` : '') +
         `<button class="fab" id="imp">+ Importar planilha</button>`;
     }
@@ -428,6 +1097,7 @@
     const imp = $('#imp'); if (imp) imp.onclick = importarNovaTurma;
     const nova = $('#nova'); if (nova) nova.onclick = criarTurmaVazia;
     const rest = $('#restaurar'); if (rest) rest.onclick = restaurarBackup;
+    const pas = $('#pasta'); if (pas) pas.onclick = () => importarPasta(null);
   }
 
   function menuGeral() {
@@ -435,7 +1105,9 @@
       <li><button value="importar">Importar planilha (nova turma)</button></li>
       <li><button value="vazia">Criar turma vazia</button></li>
       <li><button value="varias">Importar várias planilhas (turmas antigas)</button></li>
+      <li><button value="pastaProj">Importar a pasta de um projeto</button></li>
       <li><button value="pessoas">Alunos de todas as turmas</button></li>
+      <li><button value="projeto">Novo projeto (instituição / departamento)</button></li>
       <li class="sep"></li>
       ${Pasta.suportada ? '<li><button value="pasta">Pasta de trabalho</button></li>' : ''}
       <li><button value="cursos">Códigos de curso</button></li>
@@ -450,6 +1122,8 @@
       if (r.acao === 'vazia') criarTurmaVazia();
       if (r.acao === 'varias') importarVarias();
       if (r.acao === 'pessoas') go('#/pessoas');
+      if (r.acao === 'pastaProj') importarPasta(null);
+      if (r.acao === 'projeto') editarProjeto(null);
       if (r.acao === 'backup') salvarBackup();
       if (r.acao === 'restaurar') restaurarBackup();
       if (r.acao === 'sobre') sobre();
@@ -464,37 +1138,55 @@
       <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
   }
 
-  /** Cria a turma com os dados do diálogo; a instituição vira o padrão das próximas. */
-  function novaTurmaDe(d) {
-    const t = CC.novaTurma(Object.assign({}, d, { instituicao: String(d.instituicao || '').trim() }));
-    if (t.instituicao) db.instituicao = t.instituicao;
+  /** Cria a turma com os dados do diálogo, no projeto escolhido e na disciplina (achada ou criada);
+   *  herda as regras do projeto. extra = opções de CC.vincularTurma (sigla, nível, disciplinaId…). */
+  function novaTurmaDe(d, extra) {
+    const p = projetoDoForm(d);
+    const t = CC.novaTurma(Object.assign({}, d, { instituicao: p.instituicao }));
     const tema = String(d.tema || '').trim();
     if (tema) t.tema = tema;
+    CC.vincularTurma(db, t, Object.assign({}, extra || {}, { projetoId: p.id }));
+    herdarRegras(t, p);
+    db.projetoPadrao = p.id;
     return t;
   }
 
-  async function criarTurmaVazia() {
+  /** Turma vazia; a partir da tela de uma disciplina (d0), já vem com os dados dela e o plano da última turma. */
+  async function criarTurmaVazia(d0) {
+    d0 = d0 && d0.id ? d0 : null;
+    const p0 = d0 ? projeto(d0.projetoId) : projeto(contexto.projetoId || db.projetoPadrao);
+    const cfg = CC.configPadrao(p0, d0);
+    const ult = d0 ? CC.turmasDaDisciplina(db, d0).sort((x, y) => ordemPeriodo(y).localeCompare(ordemPeriodo(x)))[0] : null;
+    if (ult) {
+      cfg.dias = (ult.config.dias || []).slice();
+      cfg.categoriaDia = Object.assign({}, ult.config.categoriaDia);
+      if (!d0.config.categorias) cfg.categorias = (ult.config.categorias || []).slice();
+      ['cargaHoraria', 'horasAula'].forEach(k => { if (!d0.config[k] && ult.config[k]) cfg[k] = ult.config[k]; });
+    }
+    const plano = ult && ult.avaliacoes.length ? planoDaTurma(ult).map(v => Object.assign({}, v, { id: null, data: '' }))
+      : CC.planoPadrao(2, true, !(d0 && d0.nivel === 'pos'));
     const r = await dialogo(`<h2>Nova turma</h2><div class="stack">
-      <label class="field">Disciplina<input type="text" name="disciplina" required autofocus></label>
-      <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo"></label>
+      <label class="field">Disciplina<input type="text" name="disciplina" value="${esc(d0 ? d0.nome : '')}" required ${d0 ? '' : 'autofocus'}></label>
+      <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(d0 ? d0.codigo : '')}"></label>
       <label class="field grow">Turma<input type="text" name="turma"></label></div>
-      <label class="field">Período<input type="text" name="periodo" placeholder="ex.: 20262"></label>
-      ${campoInstituicao(db.instituicao || 'UFF')}
+      <label class="field">Período<input type="text" name="periodo" value="${esc(periodoAtualNum())}" placeholder="ex.: 20262"></label>
+      ${campoProjeto(p0 && p0.id)}
       ${campoTema('')}
-      ${camposPeriodo(CC.DEFAULT_CONFIG, true)}
-      ${camposPlano(CC.planoPadrao(2, true, true))}</div>
+      ${camposPeriodo(cfg, true)}
+      ${camposPlano(plano, cfg)}</div>
       <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Criar</button></div>`,
-      form => { ligarPlano(form); ligarPeriodo(form); });
+      form => { ligarPlano(form); ligarPeriodo(form); ligarProjeto(form); ligarCalendario(form); });
     if (r.acao !== 'ok') return;
-    const t = novaTurmaDe(r.dados);
+    const mesma = d0 && String(r.dados.codigo || '').trim() === d0.codigo && CC.norm(r.dados.disciplina) === CC.norm(d0.nome) && r.dados.projetoId === d0.projetoId;
+    const t = novaTurmaDe(r.dados, mesma ? { disciplinaId: d0.id } : {});
     aplicarPeriodo(t, lerPeriodo(r.dados), !!r.dados.gerar);
     CC.aplicarPlano(t, lerPlano(r.dados));
-    db.turmas.push(t); salvar();
+    db.turmas.push(t); ajustarSeNova(t); salvar();
     go('#/t/' + t.id + '/alunos');
   }
 
-  async function importarNovaTurma() {
-    const file = await escolherArquivo('.xls,.xlsx,.ods,.csv');
+  async function importarNovaTurma(arquivo) {
+    const file = arquivo instanceof File ? arquivo : await escolherArquivo('.xls,.xlsx,.ods,.csv');
     if (!file) return;
     const p = await lerComAjuda(file);
     if (!p) return;
@@ -509,7 +1201,11 @@
     const temDados = p.datas.length || p.cronograma.length || p.notas.length || p.notasApp;
     const datasPlanilha = p.datas.concat(p.cronograma.map(c => c.data)).sort();
     const cfgPlanilha = p.configuracao ? p.configuracao.config : {};
-    const sugestao = Object.assign({}, CC.DEFAULT_CONFIG, {
+    // Disciplina que já existe (mesmo código): sugere a carga horária e o plano dela.
+    const pCtx = projeto(contexto.projetoId || db.projetoPadrao);
+    const dExist = p.meta.codigo ? db.disciplinas.find(d => d.codigo === p.meta.codigo && (!pCtx || d.projetoId === pCtx.id)) : null;
+    const ultExist = dExist ? CC.turmasDaDisciplina(db, dExist).sort((x, y) => ordemPeriodo(y).localeCompare(ordemPeriodo(x)))[0] : null;
+    const sugestao = Object.assign(CC.configPadrao(dExist ? projeto(dExist.projetoId) : pCtx, dExist), {
       dias: diasFrequentes(datasPlanilha),
       inicio: datasPlanilha[0] || '',
       fim: p.cronograma.length ? p.cronograma.map(c => c.data).sort().pop() : ''
@@ -518,14 +1214,15 @@
     const planoSugerido = p.notasApp ? p.notasApp.plano
       : notasSugeridas.length
         ? notasSugeridas.map(n => ({ nome: n.nome, tipo: 'normal', data: '', peso: 1, max: n.max })).concat(CC.planoPadrao(0, true, true))
-        : CC.planoPadrao(2, true, true);
+        : ultExist && ultExist.avaliacoes.length ? planoDaTurma(ultExist).map(v => Object.assign({}, v, { id: null, data: '' }))
+          : CC.planoPadrao(2, true, !(dExist && dExist.nivel === 'pos'));
     const r = await dialogo(`<h2>Nova turma</h2>
       <div class="stack">
       <label class="field">Disciplina<input type="text" name="disciplina" value="${esc(p.meta.disciplina)}"></label>
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(p.meta.codigo)}"></label>
       <label class="field grow">Turma<input type="text" name="turma" value="${esc(p.meta.turma)}"></label>
       <label class="field grow">Período<input type="text" name="periodo" value="${esc(p.meta.periodo)}"></label></div>
-      ${campoInstituicao((p.configuracao && p.configuracao.instituicao) || db.instituicao || 'UFF')}
+      ${campoProjeto(dExist && dExist.projetoId)}
       ${campoTema((p.configuracao && p.configuracao.tema) || '')}
       <p class="muted">${p.alunos.length} alunos encontrados em <i>${esc(file.name)}</i>.${p.configuracao ? ' Configuração da turma lida da aba "Configuração".' : ''}</p>
       ${temDados ? opcoesImportacao(p, null) : ''}
@@ -534,9 +1231,10 @@
       ${camposPlano(planoSugerido)}
       </div>
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Criar turma</button></div>`,
-      form => { ligarPlano(form); ligarPeriodo(form); });
+      form => { ligarPlano(form); ligarPeriodo(form); ligarProjeto(form); ligarCalendario(form); });
     if (r.acao !== 'ok') return;
-    const t = novaTurmaDe(r.dados);
+    const conf = p.configuracao || {};
+    const t = novaTurmaDe(r.dados, { sigla: conf.sigla, nivel: conf.nivel, departamento: conf.departamento });
     const opts = lerOpcoes(r.dados, p, null);
     // Configuração da planilha (frequência, médias, nome curto); o resto vem dos campos do diálogo.
     ['freqMin', 'pesoAtraso', 'mediaMin', 'mediaVS', 'mediaMinPos'].forEach(k => { if (cfgPlanilha[k] != null) t.config[k] = cfgPlanilha[k]; });
@@ -548,7 +1246,7 @@
     if (!p.datas.length) CC.aplicarLista(t, p);
     const res = CC.importarDados(t, p, opts);
     aplicarPeriodo(t, lerPeriodo(r.dados), !!r.dados.gerar);
-    db.turmas.push(t); salvar();
+    db.turmas.push(t); ajustarSeNova(t); salvar();
     toast(`${t.alunos.length} alunos · ${t.aulas.length} aulas · ${res.marcacoes} marcações importadas`);
     go('#/t/' + t.id + '/chamada');
   }
@@ -594,14 +1292,6 @@
     return `<label class="field">Tema (opcional, para "Tópicos especiais…")<input type="text" name="tema" value="${esc(valor)}" placeholder="ex.: Criptografia"></label>`;
   }
 
-  /** Campo "Instituição", com as já usadas como sugestão. */
-  function campoInstituicao(valor) {
-    const usadas = Array.from(new Set(['UFF'].concat(db.turmas.map(t => t.instituicao).filter(Boolean))));
-    return `<label class="field">Instituição<input type="text" name="instituicao" list="instituicoes" value="${esc(valor)}" placeholder="ex.: UFF"></label>
-      <datalist id="instituicoes">${usadas.map(i => `<option value="${esc(i)}">`).join('')}</datalist>
-      <p class="muted small" style="margin-top:-6px">Na UFF, o curso e a forma de ingresso saem da matrícula.</p>`;
-  }
-
   function camposPeriodo(c, gerarMarcado) {
     const dias = c.dias || [];
     return `<fieldset class="grupo"><legend>Carga horária e aulas</legend><div class="stack">
@@ -615,8 +1305,9 @@
       <div class="row" id="cat-dias" data-inicial="${esc(JSON.stringify(c.categoriaDia || {}))}"></div>
       <div class="row nowrap"><label class="field grow">Início das aulas<input type="date" name="inicio" value="${c.inicio || ''}"></label>
       <label class="field grow">Fim<input type="date" name="fim" value="${c.fim || ''}"></label></div>
+      <p class="muted small" id="aviso-cal"></p>
       <label class="checks"><label><input type="checkbox" name="gerar" ${gerarMarcado ? 'checked' : ''}> gerar no cronograma as aulas que faltam</label></label>
-      <p class="muted small">Com dias, início e fim preenchidos, as datas de aula entram no cronograma (feriados você marca depois como "Sem aula").</p>
+      <p class="muted small">Com dias, início e fim preenchidos, as datas de aula entram no cronograma. Os dias sem aula do calendário letivo do projeto entram como "Sem aula"; outros feriados você marca depois.</p>
       </div></fieldset>`;
   }
 
@@ -657,7 +1348,7 @@
     Object.assign(t.config, per);
     CC.aplicarCategorias(t);
     if (gerar && per.dias.length && per.inicio && per.fim && per.inicio <= per.fim) {
-      return CC.gerarCronograma(t, per.inicio, per.fim, per.dias);
+      return CC.gerarCronograma(t, per.inicio, per.fim, per.dias, CC.calendarioDe(db, t));
     }
     return 0;
   }
@@ -810,6 +1501,7 @@
       <p><b>${plano.novos.length}</b> novo(s)${lista(plano.novos, a => a.nome)}</p>
       <p><b>${plano.saem.length}</b> sai(em) da lista <span class="muted small">(o histórico é mantido)</span>${lista(plano.saem, a => a.nome)}</p>
       ${plano.voltaram.length ? `<p><b>${plano.voltaram.length}</b> voltam à lista${lista(plano.voltaram, a => a.nome)}</p>` : ''}
+      ${t.semAvulsos && plano.novos.some(a => CC.vinculoAluno(t, a) === 'A') ? `<p class="small" style="color:var(--A)">Esta disciplina não aceita alunos avulsos, mas a lista tem ${plano.novos.filter(a => CC.vinculoAluno(t, a) === 'A').length} novo(s) com matrícula de avulso.</p>` : ''}
       ${plano.alterados.length ? `<p><b>${plano.alterados.length}</b> com dados alterados${lista(plano.alterados, x => x.aluno.nome + ' (' + x.campos.join(', ') + ')')}</p>` : ''}
       <p class="muted">${plano.mantidos} sem mudança.</p></div>
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Aplicar</button></div>`);
@@ -870,11 +1562,7 @@
       <p class="muted small">Planilhas exportadas pelo app trazem também configuração, plano de avaliação e notas.</p>
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok" ${ok.length ? '' : 'disabled'}>Importar ${ok.length}</button></div>`);
     if (r.acao !== 'ok') return;
-    ok.forEach(i => {
-      const t = CC.turmaDePlanilha(i.p, { instituicao: db.instituicao || 'UFF', dataLista: dataDoArquivo(i.f) });
-      if (r.dados.arquivar && t.periodo && String(t.periodo) < periodoAtual) t.arquivada = CC.todayISO();
-      db.turmas.push(t);
-    });
+    criarTurmasDePlanilhas(ok, projeto(contexto.projetoId), !!r.dados.arquivar);
     salvar(); render();
     toast(`${ok.length} turma(s) importada(s)`);
   }
@@ -970,9 +1658,16 @@
   }
 
   function entregarPlanilha(t, lista) {
-    const wb = CC.montarPlanilha(XLSX, t, cursos(t), { lista });
+    const p = CC.projetoDe(db, t), d = CC.disciplinaDe(db, t);
+    const wb = CC.montarPlanilha(XLSX, t, cursos(t), { lista, departamento: (p && p.departamento) || (d && d.departamento) || '' });
     const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array', compression: true });
-    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'planilha', 'xlsx'), t);
+    // Na pasta do projeto, o nome segue o da pasta da disciplina: UFF-TCC00305-LFTC-2026b[-turma].xlsx
+    let naPasta = '';
+    if (d && d.pasta) {
+      const varias = CC.turmasDaDisciplina(db, d).filter(u => u.periodo === t.periodo).length > 1;
+      naPasta = (d.pasta + '-' + CC.periodoLetra(t.periodo) + (varias && t.turma ? '-' + t.turma : '')).replace(/[\\/:*?"<>|]+/g, '-') + '.xlsx';
+    }
+    entregarArquivo(new Blob([out], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }), CC.nomeArquivo(t, 'planilha', 'xlsx'), t, naPasta);
   }
 
   /** Exporta a planilha; a aba "Lista de presença" é opcional. */
@@ -1019,7 +1714,8 @@
       <div class="row nowrap"><label class="field grow">Código<input type="text" name="codigo" value="${esc(t.codigo)}"></label>
       <label class="field grow">Turma<input type="text" name="turma" value="${esc(t.turma)}"></label>
       <label class="field grow">Período<input type="text" name="periodo" value="${esc(t.periodo)}"></label></div>
-      ${campoInstituicao(t.instituicao || '')}
+      ${campoProjeto(t.projetoId)}
+      <p class="muted small" style="margin-top:-6px">Mudar o código (ou o projeto) põe a turma em outra disciplina; mudar só o nome renomeia a disciplina (vale para todas as turmas dela).</p>
       ${campoTema(t.tema || '')}
       <label class="field">Nome curto (nos nomes dos arquivos)<input type="text" name="nomeCurto" maxlength="40" value="${esc(t.nomeCurto || '')}" placeholder="${esc(CC.nomeCurto(Object.assign({}, t, { nomeCurto: '' })))}"></label>
       <div class="row nowrap">
@@ -1032,9 +1728,28 @@
       ${camposPeriodo(c, false)}
       <p class="muted small">Hoje: ${CC.aulasPrevistas(t)} aulas no período; reprova quem tiver mais de ${CC.numBR(CC.limiteFaltas(t), CC.limiteFaltas(t) % 1 ? 1 : 0)} faltas.
       Sem carga horária, conta as aulas do cronograma.</p></div>
-      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`, ligarPeriodo);
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`,
+    form => { ligarPeriodo(form); ligarProjeto(form); ligarCalendario(form); });
     if (r.acao !== 'ok') return;
-    ['disciplina', 'codigo', 'turma', 'periodo', 'instituicao'].forEach(k => { t[k] = String(r.dados[k] || '').trim(); });
+    const discAntes = CC.disciplinaDe(db, t), codAntes = t.codigo, nomeAntes = t.disciplina;
+    ['disciplina', 'codigo', 'turma', 'periodo'].forEach(k => { t[k] = String(r.dados[k] || '').trim(); });
+    const pNovo = projetoDoForm(r.dados);
+    const mudou = !discAntes || pNovo.id !== t.projetoId || t.codigo !== codAntes || (!t.codigo && CC.norm(t.disciplina) !== CC.norm(nomeAntes));
+    const sozinha = discAntes && CC.turmasDaDisciplina(db, discAntes).length === 1;
+    const destino = t.codigo && db.disciplinas.find(d => d !== discAntes && d.projetoId === pNovo.id && d.codigo === t.codigo);
+    if (mudou && sozinha && !destino) {
+      // Única turma da disciplina (ex.: código digitado errado): corrige a própria disciplina, que guarda a pasta e o padrão.
+      Object.assign(discAntes, { codigo: t.codigo, nome: t.disciplina || discAntes.nome, projetoId: pNovo.id });
+      CC.sincronizarDisciplina(db, discAntes);
+    } else if (mudou) {
+      const n0 = db.disciplinas.length;
+      const v = CC.vincularTurma(db, t, { projetoId: pNovo.id });
+      if (db.disciplinas.length > n0) CC.ajustarDisciplina(db, v.d);
+      CC.limparDisciplinas(db);
+    } else if (t.disciplina && t.disciplina !== nomeAntes) {
+      discAntes.nome = t.disciplina;
+      CC.sincronizarDisciplina(db, discAntes);
+    }
     const curto = String(r.dados.nomeCurto || '').trim();
     if (curto) t.nomeCurto = curto; else delete t.nomeCurto;
     const tema = String(r.dados.tema || '').trim();
@@ -1055,7 +1770,8 @@
     const ok = await confirmar('Excluir turma', `Apagar <b>${esc(CC.nomeTurma(t))}</b> e toda a chamada e notas dela deste aparelho? Se quiser guardar, exporte ou faça backup antes.`, 'Excluir', true);
     if (!ok) return;
     db.turmas = db.turmas.filter(x => x.id !== t.id);
-    salvar(); go('#/');
+    CC.limparDisciplinas(db);
+    salvar(); go(t.disciplinaId && disciplina(t.disciplinaId) ? '#/d/' + t.disciplinaId : '#/');
   }
 
   function salvarBackup(t) {
@@ -1081,6 +1797,11 @@
       const i = db.turmas.findIndex(x => x.id === t.id);
       if (i >= 0) db.turmas[i] = t; else db.turmas.push(t);
     });
+    ['projetos', 'disciplinas'].forEach(k => (dados[k] || []).forEach(x => {
+      const i = db[k].findIndex(y => y.id === x.id);
+      if (i >= 0) db[k][i] = x; else db[k].push(x);
+    }));
+    CC.organizar(db);
     salvar(); go('#/');
     toast(dados.turmas.length + ' turma(s) restaurada(s)');
   }
@@ -1397,18 +2118,19 @@
       <div class="acoes"><button class="btn primary" value="">Entendi</button></div>`);
   }
 
-  async function configurarPasta(t) {
+  async function configurarPasta(t, proj) {
     if (!Pasta.suportada) {
       return dialogo(`<h2>Pasta de trabalho</h2>
         <p>${esc(nomeNavegador())} não permite que o app escolha uma pasta.${/Android/i.test(navigator.userAgent) ? ' No Android, o Chrome (versão 132 ou mais nova) permite: abra o app nele e instale pelo menu ⋮ → Instalar app.' : ''}</p>
         <p class="muted small">Ao exportar, use <b>Compartilhar</b> para mandar ao Google Drive (ou outro app) ou <b>Baixar</b> para a pasta Downloads; ao importar, o seletor de arquivos do sistema abre em qualquer pasta. No computador (Chrome ou Edge), a pasta de trabalho funciona.</p>
         <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
     }
-    const k = Pasta.chave(t);
-    const atual = await Pasta.obter(k), geral = t ? await Pasta.obter('global') : null;
-    const r = await dialogo(`<h2>Pasta de trabalho${t ? ' da turma' : ''}</h2>
-      <p>${atual ? `Atual: <b>${esc(atual.name)}</b>` : t ? `A turma usa a pasta geral${geral ? `: <b>${esc(geral.name)}</b>` : ' (nenhuma escolhida)'}.` : 'Nenhuma pasta escolhida.'}</p>
-      <p class="muted small">${t ? 'Exportações, backups e importações desta turma usam esta pasta; sem ela, vale a pasta geral.' : 'Exportações, backups e importações usam esta pasta (cada turma pode ter a sua, no menu da turma).'}
+    const k = proj ? 'p:' + proj.id : Pasta.chave(t);
+    const atual = await Pasta.obter(k), geral = t || proj ? await Pasta.obter('global') : null;
+    const r = await dialogo(`<h2>Pasta de trabalho${t ? ' da turma' : proj ? ' do projeto' : ''}</h2>
+      <p>${atual ? `Atual: <b>${esc(atual.name)}</b>` : t || proj ? `Usa a pasta ${t ? 'do projeto ou a ' : ''}geral${geral ? `: <b>${esc(geral.name)}</b>` : ' (nenhuma escolhida)'}.` : 'Nenhuma pasta escolhida.'}</p>
+      <p class="muted small">${proj ? 'As planilhas das turmas do projeto são salvas na pasta da disciplina (padrão UFF-código-sigla, como em LK-UFF-aulas), com o nome no mesmo padrão.'
+        : t ? 'Exportações, backups e importações desta turma usam esta pasta; sem ela, vale a do projeto ou a geral.' : 'Exportações, backups e importações usam esta pasta (cada projeto e cada turma podem ter a sua).'}
       O navegador pode pedir permissão para editar arquivos nela.</p>
       <div class="acoes">${atual ? '<button class="btn danger" value="esquecer">Esquecer</button>' : ''}
       <button class="btn" value="">Fechar</button><button class="btn primary" value="escolher">${atual ? 'Trocar pasta…' : 'Escolher pasta…'}</button></div>`);
@@ -1680,6 +2402,11 @@
 
   /* ---------- tela: alunos ---------- */
 
+  /** Aluno avulso numa disciplina que não aceita avulsos ("Tópicos especiais…"). */
+  function avulsoProibido(t, a) {
+    return !!t.semAvulsos && CC.vinculoAluno(t, a) === 'A';
+  }
+
   function telaAlunos(t) {
     const todos = CC.alunosOrdenados(t, true);
     const ativos = todos.filter(a => a.ativo).length;
@@ -1696,7 +2423,7 @@
       h += barraVisao(t, todos.length, lista);
       h += `<div class="lista-chamada">` + (lista.length ? lista.map(({ a, st }) => `<div class="aluno-row ${a.ativo ? '' : 'inativo'}" data-id="${a.id}">
           <div class="nome">${esc(nomeCurto(a.nome))}
-          <div class="det">${esc(a.matricula || 'sem matrícula')}${cursoDe(t, a) ? ' · ' + esc(cursoDe(t, a)) : ''}${a.ativo ? '' : ' · fora da lista' + (a.saiuEm ? ' (' + esc(a.saiuEm.includes('-') ? CC.fmtDate(a.saiuEm) : a.saiuEm) + ')' : '')}${a.origem === 'manual' ? ' · incluído à mão' : ''}</div></div>
+          <div class="det">${esc(a.matricula || 'sem matrícula')}${cursoDe(t, a) ? ' · ' + esc(cursoDe(t, a)) : ''}${avulsoProibido(t, a) ? ' · <span class="tag BAIXA">avulso não permitido</span>' : ''}${a.ativo ? '' : ' · fora da lista' + (a.saiuEm ? ' (' + esc(a.saiuEm.includes('-') ? CC.fmtDate(a.saiuEm) : a.saiuEm) + ')' : '')}${a.origem === 'manual' ? ' · incluído à mão' : ''}</div></div>
           <div class="right small num">${CC.numBR(st.faltas)} F${st.media != null ? ' · ' + CC.numBR(st.mf != null ? st.mf : st.media) : ''}${st.sitNota.cod ? ` <span class="tag ${st.sitNota.cod}">${{ RF: 'RF', OK: 'OK', VS: 'VS', BAIXA: '↓' }[st.sitNota.cod]}</span>` : ''}</div></div>`).join('')
         : '<div class="empty">Nenhum aluno neste filtro.</div>') + '</div>';
     }
@@ -1753,7 +2480,7 @@
       <h2>${esc(nomeCurto(a.nome))}</h2>
       <div class="muted small">${esc(a.matricula)}${a.email ? ' · ' + esc(a.email) : ''}</div>
       ${(i => cursoDe(t, a) ? `<div class="small">${esc(cursoDe(t, a))}${i ? ` <span class="muted">· ${i.nivel === 'grad' ? 'ingresso ' : ''}${esc(i.ingresso)}</span>` : ''}</div>` : '')(CC.infoMatricula(a.matricula, cursos(t)))}
-      ${a.ativo ? '' : '<span class="tag fora">fora da lista</span>'}</div>
+      ${a.ativo ? '' : '<span class="tag fora">fora da lista</span>'}${avulsoProibido(t, a) ? ' <span class="tag BAIXA">avulso: a disciplina não aceita</span>' : ''}</div>
       <div class="stack" style="flex:none"><button class="btn small" id="editar">Editar</button>${a.email ? '<button class="btn small" id="mail-aluno">✉ E-mail</button>' : ''}</div></div>
       <div class="contadores"><span class="c-P">${st.P} P</span><span class="c-A">${st.A} A</span><span class="c-J">${st.J} J</span><span class="c-F">${st.F} F</span></div>
       <p class="small" style="margin:10px 0 0">Faltas: <b>${CC.numBR(st.faltas)}</b> de ${limTxt(t)} permitidas
@@ -1798,9 +2525,12 @@
   function telaCronograma(t) {
     const aulas = CC.aulasOrdenadas(t);
     const hoje = CC.todayISO();
+    const cal = CC.calendarioDe(db, t), pendCal = cal ? feriadosPendentes(t, cal) : 0;
     let h = `<div class="card"><div class="row"><div class="grow"><b>${CC.aulasPrevistas(t)}</b> aulas previstas
-      <div class="muted small">${aulas.filter(a => CC.aulaRealizada(t, a)).length} com chamada · máximo de ${limTxt(t)} faltas</div></div>
-      <button class="btn small" id="gerar">Gerar datas</button></div></div>`;
+      <div class="muted small">${aulas.filter(a => CC.aulaRealizada(t, a)).length} com chamada · máximo de ${limTxt(t)} faltas</div>
+      ${cal ? `<div class="muted small">Calendário letivo ${esc(CC.chavePeriodo(t.periodo))}: ${esc(resumoCalendario(cal))}</div>` : ''}</div>
+      <button class="btn small" id="gerar">Gerar datas</button></div>
+      ${pendCal ? `<button class="btn small" id="aplicar-cal" style="margin-top:8px">Marcar ${pendCal} aula(s) em feriado como "Sem aula"</button>` : ''}</div>`;
     h += `<div class="lista-chamada">` + (aulas.length ? aulas.map(aula => {
       const feita = CC.aulaRealizada(t, aula);
       const c = feita ? CC.contarAula(t, aula) : null;
@@ -1813,6 +2543,7 @@
     h += `<button class="fab" id="add">+ Aula</button>`;
     app.innerHTML = h;
     $('#gerar').onclick = () => gerarDatas(t);
+    if (pendCal) $('#aplicar-cal').onclick = () => { const n = CC.aplicarCalendario(t, cal); salvar(); render(); toast(n + ' aula(s) marcada(s) como "Sem aula"'); };
     $('#add').onclick = () => editarAula(t, null);
     app.querySelectorAll('.aula-item').forEach(el => el.onclick = ev => {
       const b = ev.target.closest('[data-chamada]');
@@ -1823,20 +2554,20 @@
 
   async function gerarDatas(t) {
     const aulas = CC.aulasOrdenadas(t);
-    const c = t.config;
-    const ini = c.inicio || (aulas.length ? aulas[0].data : CC.todayISO());
-    const fim = c.fim || (aulas.length ? aulas[aulas.length - 1].data : CC.addDays(CC.todayISO(), 120));
+    const c = t.config, cal = CC.calendarioDe(db, t);
+    const ini = c.inicio || (cal && cal.inicio) || (aulas.length ? aulas[0].data : CC.todayISO());
+    const fim = c.fim || (cal && cal.fim) || (aulas.length ? aulas[aulas.length - 1].data : CC.addDays(CC.todayISO(), 120));
     const diasUsados = new Set(c.dias && c.dias.length ? c.dias : aulas.map(a => CC.weekday(a.data)));
     const r = await dialogo(`<h2>Gerar datas de aula</h2><div class="stack">
       <div class="row nowrap"><label class="field grow">De<input type="date" name="ini" value="${ini}" required></label>
       <label class="field grow">Até<input type="date" name="fim" value="${fim}" required></label></div>
       <div class="checks">${[1, 2, 3, 4, 5, 6].map(d => `<label><input type="checkbox" name="dia" value="${d}" ${diasUsados.has(d) ? 'checked' : ''}> ${CC.DIAS[d]}</label>`).join('')}</div>
-      <p class="muted small">Datas que já existem não são duplicadas. Depois marque feriados como "Sem aula".</p></div>
+      <p class="muted small">Datas que já existem não são duplicadas. ${cal ? `Os dias sem aula do calendário letivo (${(cal.eventos || []).filter(e => e.semAula).length}) entram como "Sem aula".` : 'Depois marque feriados como "Sem aula" (ou preencha o calendário letivo do projeto).'}</p></div>
       <div class="acoes"><button class="btn" value="" formnovalidate>Cancelar</button><button class="btn primary" value="ok">Gerar</button></div>`);
     if (r.acao !== 'ok') return;
     const dias = [].concat(r.dados.dia || []).map(Number);
     if (!dias.length) return toast('Escolha ao menos um dia da semana');
-    const n = CC.gerarCronograma(t, r.dados.ini, r.dados.fim, dias);
+    const n = CC.gerarCronograma(t, r.dados.ini, r.dados.fim, dias, cal);
     Object.assign(c, { inicio: r.dados.ini, fim: r.dados.fim, dias });
     salvar(); render();
     toast(n + ' aula(s) adicionada(s)');
@@ -2056,7 +2787,7 @@
     }
   } catch (e) { /* sem sessionStorage */ }
   // Ganchos para depuração no console.
-  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma };
+  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma, importarNovaTurma, importarPasta, linhasDoPDF, lerCalendarioPDF };
   // O IndexedDB pode ter dados mais novos (ou os únicos, quando não couberam no localStorage).
   if (window.indexedDB) {
     idbLer().then(json => {

@@ -292,3 +292,8 @@ a.hist .grow { flex: 1 1 60%; min-width: 0; }
 a.hist .muted { flex: 0 1 auto; text-align: right; }
 .card.pessoa .chips { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 4px; }
 .card.pessoa .chips .tag { text-decoration: none; }
+
+/* projetos, disciplinas e calendário (0.8.0) */
+h3.secao { margin: 18px 4px 8px; color: var(--muted); font-size: 14px; font-weight: 600; }
+ul.eventos { margin: 8px 0 4px; padding-left: 18px; }
+ul.eventos li { margin: 2px 0; }

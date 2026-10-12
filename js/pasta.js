@@ -1,5 +1,5 @@
 /* ClassroomControl — pasta de trabalho (File System Access API).
- * Guarda a pasta escolhida (geral e, se quiser, uma por turma) no IndexedDB do navegador,
+ * Guarda a pasta escolhida (geral, uma por projeto e, se quiser, uma por turma) no IndexedDB do navegador,
  * para exportar e importar direto nela. Onde a API não existe (parte dos navegadores do
  * Android), o app continua usando baixar/compartilhar. */
 (function (g) {
@@ -61,15 +61,16 @@
   }
 
   async function escolher(k) {
-    const h = await g.showDirectoryPicker({ id: k === 'global' ? 'chamada-geral' : 'chamada-turma', mode: 'readwrite', startIn: 'documents' });
+    const id = k === 'global' ? 'chamada-geral' : k.startsWith('p:') ? 'chamada-projeto' : 'chamada-turma';
+    const h = await g.showDirectoryPicker({ id, mode: 'readwrite', startIn: 'documents' });
     await guardar(k, h);
     return h;
   }
 
-  /** Pasta a usar para a turma (a dela ou a geral), já com permissão; ou null. */
+  /** Pasta a usar para a turma (a dela, a do projeto ou a geral), já com permissão; ou null. */
   async function da(t) {
     if (!suportada) return null;
-    for (const k of [t ? chave(t) : null, 'global'].filter(Boolean)) {
+    for (const k of [t ? chave(t) : null, t && t.projetoId ? 'p:' + t.projetoId : null, 'global'].filter(Boolean)) {
       const h = await obter(k);
       if (!h) continue;
       try { if (await permitir(h)) return { handle: h, chave: k }; } catch (e) { /* sem permissão */ }
@@ -99,6 +100,21 @@
     return out.sort((a, b) => b.data - a.data);
   }
 
+  /** Planilhas da pasta e das subpastas (até `prof` níveis): [{ file, caminho: ['UFF-TCC00305-LFTC', 'x.xlsx'] }]. */
+  async function arquivos(h, exts, prof, caminho) {
+    caminho = caminho || [];
+    let out = [];
+    for await (const e of h.values()) {
+      if (e.name.startsWith('.') || e.name.startsWith('~$')) continue;
+      if (e.kind === 'directory') {
+        if (prof > 0) out = out.concat(await arquivos(e, exts, prof - 1, caminho.concat(e.name)));
+      } else if (exts.some(x => e.name.toLowerCase().endsWith(x))) {
+        out.push({ file: await e.getFile(), caminho: caminho.concat(e.name) });
+      }
+    }
+    return out.sort((a, b) => a.caminho.join('/').localeCompare(b.caminho.join('/')));
+  }
+
   async function salvarComo(nome, blob, inicio) {
     const h = await g.showSaveFilePicker({ suggestedName: nome, startIn: inicio || 'documents' });
     const w = await h.createWritable();
@@ -107,5 +123,5 @@
     return h.name;
   }
 
-  g.Pasta = { suportada, suportaSalvarComo, navegadorSemSeletor, marcarSemSeletor, chave, obter, escolher, esquecer, permitir, da, existe, gravar, listar, salvarComo };
+  g.Pasta = { suportada, suportaSalvarComo, navegadorSemSeletor, marcarSemSeletor, chave, obter, guardar, escolher, esquecer, permitir, da, existe, gravar, listar, arquivos, salvarComo };
 })(window);

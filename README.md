@@ -3,10 +3,30 @@
 App web instalável (PWA) para fazer chamada pelo celular Android e organizar a turma.
 Funciona offline; os dados ficam só no aparelho.
 
-**Versão 0.7.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
+**Versão 0.8.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
 planejadas; aí vira 1.0.
 
 ## O que faz
+- **Projetos, disciplinas e turmas.** Um projeto é uma instituição (e, se quiser, um departamento):
+  guarda as regras das turmas (frequência mínima, peso do atraso, médias) e o calendário letivo. Cada
+  disciplina (código, nome, sigla, nível graduação/pós/outro, se aceita avulsos) guarda a carga horária
+  e os tipos de aula; as turmas novas herdam tudo e a última turma da disciplina sugere o plano de
+  avaliação e os dias de aula. Quem já usava o app tem os projetos e as disciplinas montados a partir
+  das turmas que já existem.
+- **Importar a pasta de um projeto** (ex.: `LK-UFF-aulas`): lê todas as planilhas da pasta e das
+  subpastas; cada subpasta no padrão `UFF-código-sigla` vira uma disciplina e cada planilha uma turma
+  (as de períodos passados ficam arquivadas; turmas que já existem não são duplicadas). A pasta pode
+  ficar como pasta do projeto: a planilha exportada de uma turma é salva na pasta da disciplina, com o
+  nome no mesmo padrão (`UFF-TCC00305-LFTC-2026b.xlsx`).
+- **Calendário letivo** de cada período do projeto (início, fim, dias sem aula e avisos): lido do PDF do
+  calendário escolar da universidade ([pdf.js](https://mozilla.github.io/pdf.js/), sob demanda), digitado
+  (`07/09 Independência`, `13/10 a 17/10 Semana acadêmica`, `* 15/12 prazo das notas` para aviso),
+  deduzido dos cronogramas das turmas ou completado com a previsão dos feriados (nacionais, do RJ, de Niterói e
+  o Dia do Professor, feriado escolar na UFF). A lista oficial da UFF sai numa resolução própria no começo do
+  ano (<https://www.uff.br/sobre/calendarios/>); o PDF dela também é lido: os feriados e pontos facultativos vão
+  para os períodos em que caem, e dos municipais só os de Niterói.
+  Ao gerar o cronograma de uma turma, os feriados entram como "Sem aula"; também dá para marcar de uma
+  vez as aulas que já estavam no cronograma.
 - **Cria a turma** a partir da lista de inscritos exportada pelo sistema acadêmico da UFF
   (.xls/.xlsx), já indicando carga horária, dias da semana e período das aulas (gera o
   cronograma) e o plano de avaliação.
@@ -97,6 +117,7 @@ python -m http.server 8765
 e abra `http://localhost:8765/`.
 
 - `js/core.js` — lógica (leitura de planilhas, mesclagem, estatísticas, exportação)
+- `js/projetos.js` — projetos, disciplinas e calendário letivo (feriados, leitura do PDF do calendário)
 - `js/app.js` — interface
 - `js/ocr.js` — leitura de folhas por foto (preparo da imagem, OCR, detecção de assinatura)
 - `js/pasta.js` — pasta de trabalho (File System Access API)

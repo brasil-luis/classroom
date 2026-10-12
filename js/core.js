@@ -459,6 +459,9 @@
       const n = num(v);
       if (k === 'INSTITUICAO') r.instituicao = txt;
       else if (k === 'NOME CURTO') r.nomeCurto = txt;
+      else if (k === 'DEPARTAMENTO') r.departamento = txt;
+      else if (k === 'SIGLA') r.sigla = txt;
+      else if (k.startsWith('NIVEL')) r.nivel = /POS/.test(norm(txt)) ? 'pos' : /GRAD/.test(norm(txt)) ? 'grad' : 'outro';
       else if (k === 'TEMA') r.tema = txt;
       else if (k === 'DISCIPLINA') r.meta.disciplina = txt;
       else if (k === 'CODIGO') r.meta.codigo = txt;
@@ -827,6 +830,8 @@
     Object.keys(cfg.config).forEach(k => { if (cfg.config[k] != null) t.config[k] = cfg.config[k]; });
     if (cfg.nomeCurto) t.nomeCurto = cfg.nomeCurto;
     if (cfg.tema) t.tema = cfg.tema;
+    if (cfg.sigla) t.sigla = cfg.sigla;
+    if (cfg.nivel) t.nivel = cfg.nivel;
     const soLista = !p.datas.length && !p.cronograma.length && !p.notas.length && !p.notasApp;
     if (soLista) aplicarLista(t, p, extra && extra.dataLista);
     else {
@@ -838,14 +843,16 @@
     return t;
   }
 
-  /** Gera aulas entre duas datas nos dias da semana escolhidos (0 = domingo). */
-  function gerarCronograma(t, inicio, fim, dias) {
+  /** Gera aulas entre duas datas nos dias da semana escolhidos (0 = domingo). Com o calendário letivo
+   *  (CC.semAulaEm), os feriados e recessos entram como "sem aula". Devolve quantas aulas criou. */
+  function gerarCronograma(t, inicio, fim, dias, cal) {
     let n = 0;
     for (let d = inicio; d <= fim; d = addDays(d, 1)) {
       if (!dias.includes(weekday(d))) continue;
       if (aulaDaData(t, d, 0, false)) continue;
-      aulaDaData(t, d, 0, true);
-      n++;
+      const feriado = cal && g.CC.semAulaEm ? g.CC.semAulaEm(cal, d) : null;
+      const aula = aulaDaData(t, d, 0, true, feriado ? feriado.descricao : '');
+      if (feriado) aula.tipo = 'sem-aula'; else n++;
     }
     return n;
   }
@@ -1304,7 +1311,7 @@
     const v = vinculoAluno(t, a);
     if (v) return NIVEL_VINCULO[v] || 'grad';
     const i = ehUFF(t) ? infoMatricula(a.matricula, {}) : null;
-    return i ? i.nivel : 'grad';
+    return i ? i.nivel : t.nivel === 'pos' ? 'pos' : 'grad';
   }
 
   function mediaMinPos(t) {
@@ -1862,7 +1869,10 @@
     // Rótulos lidos de volta por parseConfiguracao ao importar a planilha (não mudar sem mudar lá).
     const itens = [['Identificação', null],
       ['Instituição', t.instituicao || '—'],
+      ['Departamento', (opcoes && opcoes.departamento) || '—'],
       ['Disciplina', t.disciplina || '—'],
+      ['Nível da disciplina', { grad: 'Graduação', pos: 'Pós-graduação', outro: 'Outro' }[t.nivel] || '—'],
+      ['Sigla', t.sigla || '—'],
       ['Código', t.codigo || '—'],
       ['Turma', t.turma || '—'],
       ['Período', t.periodo || '—'],
@@ -1932,7 +1942,8 @@
   /** Nome curto da turma (para arquivos): o que o professor definiu ou sigla + período, ex. "LFTC 2026-2". */
   function nomeCurto(t) {
     if (t.nomeCurto) return t.nomeCurto;
-    return [siglaDisciplina(t.tema || t.disciplina) || t.codigo || 'Turma', periodoCurto(t.periodo)].filter(Boolean).join(' ');
+    const sigla = t.tema ? siglaDisciplina(t.tema) : (t.sigla || siglaDisciplina(t.disciplina));
+    return [sigla || t.codigo || 'Turma', periodoCurto(t.periodo)].filter(Boolean).join(' ');
   }
 
   /** Nome de arquivo legível: "LFTC 2026-2 - planilha.xlsx", "Chamada - backup 2026-10-12.json". */
