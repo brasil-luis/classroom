@@ -13,7 +13,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.8.1';
+  const VERSAO = '0.8.2';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -733,6 +733,22 @@
     return !!per && !/resumo/i.test(i.f.name);
   }
 
+  /** Planilhas de um .zip da pasta do projeto, com o caminho (as subpastas viram disciplinas). */
+  async function entradasDoZip(z) {
+    if (semXLSX()) throw new Error('biblioteca de planilhas indisponível');
+    const cfb = XLSX.CFB.read(new Uint8Array(await z.arrayBuffer()), { type: 'array' });
+    let itens = cfb.FullPaths.map((p, i) => ({ partes: p.split('/').filter(Boolean).slice(1), f: cfb.FileIndex[i] }))
+      .filter(x => x.f.type === 2 && x.f.content && x.partes.length && !x.partes.some(n => n.startsWith('.') || n.startsWith('~$') || n.startsWith('__MACOSX'))
+        && EXTS_PLANILHA.some(e => x.partes[x.partes.length - 1].toLowerCase().endsWith(e)));
+    // Se tudo está dentro de uma pasta só (o .zip de "LK-UFF-aulas"), ela é a pasta do projeto.
+    let nomePasta = z.name.replace(/\.zip$/i, '').replace(/-\d{8}T\d{6}Z-\d+-\d+$/, '');   // nome do .zip do Google Drive
+    const topo = new Set(itens.map(x => x.partes[0]));
+    if (topo.size === 1 && itens.every(x => x.partes.length > 1)) { nomePasta = itens[0].partes[0]; itens = itens.map(x => ({ partes: x.partes.slice(1), f: x.f })); }
+    const entradas = itens.map(x => ({ file: new File([x.f.content], x.partes[x.partes.length - 1]), caminho: x.partes }))
+      .sort((a, b) => a.caminho.join('/').localeCompare(b.caminho.join('/')));
+    return { nomePasta, entradas };
+  }
+
   /** Cria uma turma para cada planilha lida e põe no projeto/disciplina. itens: [{ f, p, pasta? }]. Devolve as disciplinas novas. */
   function criarTurmasDePlanilhas(itens, proj, arquivar) {
     const atual = periodoAtualNum();
@@ -768,12 +784,31 @@
       toast('Procurando planilhas em ' + nomePasta + '…');
       try { entradas = await Pasta.arquivos(handle, EXTS_PLANILHA, 3); } catch (e) { return toast('Não consegui ler a pasta: ' + e.message); }
     } else {
-      const files = await escolherPastaDoSistema();
-      if (!files.length) return;
-      nomePasta = (files[0].webkitRelativePath || '').split('/')[0] || 'pasta';
-      entradas = files.filter(f => EXTS_PLANILHA.some(x => f.name.toLowerCase().endsWith(x)) && !f.name.startsWith('~$'))
-        .map(f => f.webkitRelativePath ? { file: f, caminho: f.webkitRelativePath.split('/').slice(1) }
-          : { file: f, caminho: [f.name], semPasta: true });   // navegador que não escolhe pasta: vieram só arquivos
+      // Sem seletor de pasta (celular, DuckDuckGo, Firefox): .zip da pasta, a pasta pelo seletor de arquivos
+      // (só no computador) ou várias planilhas soltas.
+      const celular = /Android|iPhone|iPad/i.test(navigator.userAgent);
+      const r = await dialogo(`<h2>Importar a pasta de um projeto</h2>
+        <p>${esc(nomeNavegador())} não deixa o app abrir uma pasta${celular ? ' no celular' : ''}. Escolha como trazer as planilhas:</p>
+        <div class="stack"><button class="btn primary block" value="zip">Pasta compactada (.zip)</button>
+        ${celular ? '' : '<button class="btn block" value="pasta">Escolher a pasta</button>'}
+        <button class="btn block" value="varias">Várias planilhas (sem as subpastas)</button></div>
+        <p class="muted small">O .zip guarda as subpastas, que viram as disciplinas. No Google Drive pelo navegador, "Fazer download" de uma pasta
+        entrega o .zip (no computador, ou no celular com "Site para computador"). Outro caminho: importar a pasta no computador
+        (Chrome ou Edge), salvar um backup e restaurá-lo aqui.</p>
+        <div class="acoes"><button class="btn" value="">Cancelar</button></div>`);
+      if (!r.acao) return;
+      if (r.acao === 'zip') {
+        const z = await escolherDoSistema('.zip,application/zip', false);
+        if (!z) return;
+        try { ({ nomePasta, entradas } = await entradasDoZip(z)); } catch (e) { return toast('Não consegui abrir o .zip: ' + e.message); }
+      } else {
+        const files = r.acao === 'pasta' ? await escolherPastaDoSistema() : await escolherDoSistema('.xls,.xlsx,.ods', true);
+        if (!files || !files.length) return toast(r.acao === 'pasta' ? 'O navegador não entregou os arquivos da pasta. Use o .zip.' : 'Nenhum arquivo escolhido.');
+        nomePasta = (files[0].webkitRelativePath || '').split('/')[0] || 'planilhas';
+        entradas = files.filter(f => EXTS_PLANILHA.some(x => f.name.toLowerCase().endsWith(x)) && !f.name.startsWith('~$'))
+          .map(f => f.webkitRelativePath ? { file: f, caminho: f.webkitRelativePath.split('/').slice(1) }
+            : { file: f, caminho: [f.name], semPasta: true });   // vieram só arquivos, sem as pastas
+      }
     }
     if (!entradas.length) return toast('Nenhuma planilha (.xls, .xlsx, .ods) nessa pasta.');
     if (semXLSX()) return;
@@ -2811,7 +2846,7 @@
     }
   } catch (e) { /* sem sessionStorage */ }
   // Ganchos para depuração no console.
-  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma, importarNovaTurma, importarPasta, linhasDoPDF, lerCalendarioPDF };
+  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma, importarNovaTurma, importarPasta, entradasDoZip, linhasDoPDF, lerCalendarioPDF };
   // O IndexedDB pode ter dados mais novos (ou os únicos, quando não couberam no localStorage).
   if (window.indexedDB) {
     idbLer().then(json => {
