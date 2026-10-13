@@ -13,7 +13,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.8.0';
+  const VERSAO = '0.8.1';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -726,6 +726,13 @@
     });
   }
 
+  /** Planilha que parece de uma turma: tem período (na lista ou na aba Configuração) e não é um resumo
+   *  (ex.: UFF-aulas-resumo.xlsx, com as pessoas de todas as turmas). As outras vêm desmarcadas. */
+  function pareceTurma(i) {
+    const per = i.p.meta.periodo || (i.p.configuracao && i.p.configuracao.meta.periodo);
+    return !!per && !/resumo/i.test(i.f.name);
+  }
+
   /** Cria uma turma para cada planilha lida e põe no projeto/disciplina. itens: [{ f, p, pasta? }]. Devolve as disciplinas novas. */
   function criarTurmasDePlanilhas(itens, proj, arquivar) {
     const atual = periodoAtualNum();
@@ -795,14 +802,16 @@
       i.existe = existentes.has(i.chave) || vistas.has(i.chave);
       vistas.add(i.chave);
       i.ok = i.p.alunos.length > 0 && !i.existe;
+      i.marcar = i.ok && !i.raiz && pareceTurma(i);
     });
     const lin = i => !i.p ? 'não abriu (com senha ou corrompida?)' : !i.p.alunos.length ? 'sem alunos reconhecidos' : i.existe ? 'turma já existe'
+      : !pareceTurma(i) ? `não parece uma turma (sem período ou é um resumo) · ${i.p.alunos.length} nomes`
       : `${[CC.periodoCurto(i.p.meta.periodo), i.p.meta.turma].filter(Boolean).join(' · ')} · ${i.p.alunos.length} alunos`;
     const inst = maisComum(itens.map(i => i.pasta && i.pasta.instituicao).filter(Boolean)) || 'UFF';
     const deptos = Array.from(new Set(itens.map(i => i.pasta && i.pasta.departamento).filter(Boolean)));
     const projSel = proj ? proj.id : ((db.projetos.find(p => CC.norm(p.nome) === CC.norm(nomePasta)) || {}).id || 'novo');
     const nPastas = new Set(itens.map(i => i.pasta && i.pasta.nome).filter(Boolean)).size;
-    const marcadas = itens.filter(i => i.ok && !i.raiz).length;
+    const marcadas = itens.filter(i => i.marcar).length;
     const r = await dialogo(`<h2>Importar “${esc(nomePasta)}”</h2>
       <p class="muted small">${itens.length} planilha(s)${nPastas ? ` em ${nPastas} pasta(s) de disciplina` : ''}. Cada pasta no padrão <b>UFF-código-sigla</b> vira uma disciplina; cada planilha, uma turma.</p>
       <label class="field">Projeto<select name="projetoId" id="sel-projeto">${db.projetos.map(p => `<option value="${p.id}" ${p.id === projSel ? 'selected' : ''}>${esc(p.nome)}</option>`).join('')}
@@ -813,8 +822,8 @@
       <div class="checks"><label><input type="checkbox" name="arquivar" checked> arquivar as turmas de períodos anteriores ao atual</label>
       ${handle && Pasta.suportada ? '<label><input type="checkbox" name="guardar" checked> salvar nesta pasta as planilhas exportadas das turmas do projeto (cada uma na pasta da sua disciplina)</label>' : ''}</div>
       <details class="small"><summary><b id="conta-sel">${marcadas}</b> de ${itens.length} planilha(s) selecionada(s)</summary>
-      <div class="scroll checks">${itens.map((i, k) => `<label><input type="checkbox" name="arq" value="${k}" ${i.ok && !i.raiz ? 'checked' : ''} ${i.ok ? '' : 'disabled'}> ${esc(i.caminho)} <span class="muted">— ${esc(lin(i))}</span></label>`).join('')}</div></details>
-      <p class="muted small">Planilhas soltas na raiz da pasta (como um resumo) vêm desmarcadas.</p>
+      <div class="scroll checks">${itens.map((i, k) => `<label><input type="checkbox" name="arq" value="${k}" ${i.marcar ? 'checked' : ''} ${i.ok ? '' : 'disabled'}> ${esc(i.caminho)} <span class="muted">— ${esc(lin(i))}</span></label>`).join('')}</div></details>
+      <p class="muted small">Planilhas soltas na raiz da pasta e as que não parecem de uma turma (sem período, ou um resumo) vêm desmarcadas.</p>
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Importar</button></div>`,
     form => {
       ligarProjeto(form);
@@ -1113,6 +1122,7 @@
       <li><button value="cursos">Códigos de curso</button></li>
       <li><button value="backup">Salvar backup (todas as turmas)</button></li>
       <li><button value="restaurar">Restaurar backup</button></li>
+      <li><button value="apagar" style="color:var(--danger)">Apagar todas as turmas e projetos</button></li>
       <li class="sep"></li>
       <li><button value="sobre">Sobre</button></li>
       </ul>`).then(r => {
@@ -1126,6 +1136,7 @@
       if (r.acao === 'projeto') editarProjeto(null);
       if (r.acao === 'backup') salvarBackup();
       if (r.acao === 'restaurar') restaurarBackup();
+      if (r.acao === 'apagar') apagarTudo();
       if (r.acao === 'sobre') sobre();
     });
   }
@@ -1552,12 +1563,12 @@
       if (p) Object.defineProperty(p, 'chave', { value: chave });
       itens.push({ f, p, existe, chave });
     }
-    const ok = itens.filter(i => i.p && i.p.alunos.length && !i.existe);
+    const ok = itens.filter(i => i.p && i.p.alunos.length && !i.existe && pareceTurma(i));
     const periodoAtual = (d => d.getFullYear() + (d.getMonth() < 7 ? '1' : '2'))(new Date());
     const lin = i => !i.p ? 'não abriu' : !i.p.alunos.length ? 'sem alunos reconhecidos (importe sozinha para escolher as colunas)'
-      : i.existe ? 'já existe esta turma' : `${esc([i.p.meta.codigo, i.p.meta.turma, i.p.meta.periodo].filter(Boolean).join(' ') || i.p.meta.disciplina || '?')} · ${i.p.alunos.length} alunos`;
+      : i.existe ? 'já existe esta turma' : !pareceTurma(i) ? 'ignorada: não parece uma turma (sem período ou é um resumo); importe sozinha se for' : `${esc([i.p.meta.codigo, i.p.meta.turma, i.p.meta.periodo].filter(Boolean).join(' ') || i.p.meta.disciplina || '?')} · ${i.p.alunos.length} alunos`;
     const r = await dialogo(`<h2>Importar ${files.length} planilha(s)</h2>
-      <div class="scroll"><ul class="small">${itens.map(i => `<li>${i.p && i.p.alunos.length && !i.existe ? '✓' : '—'} ${esc(i.f.name)}: ${lin(i)}</li>`).join('')}</ul></div>
+      <div class="scroll"><ul class="small">${itens.map(i => `<li>${ok.includes(i) ? '✓' : '—'} ${esc(i.f.name)}: ${lin(i)}</li>`).join('')}</ul></div>
       <div class="checks"><label><input type="checkbox" name="arquivar" checked> arquivar as turmas de períodos anteriores a ${periodoAtual.slice(0, 4)}/${periodoAtual[4]}</label></div>
       <p class="muted small">Planilhas exportadas pelo app trazem também configuração, plano de avaliação e notas.</p>
       <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok" ${ok.length ? '' : 'disabled'}>Importar ${ok.length}</button></div>`);
@@ -1778,6 +1789,19 @@
     const dados = t ? { versao: 1, turmas: [t] } : db;
     const nome = CC.nomeArquivo(t || null, 'backup ' + CC.todayISO(), 'json');
     entregarArquivo(new Blob([JSON.stringify(dados)], { type: 'application/json' }), nome, t || null);
+  }
+
+  /** Começar do zero: apaga turmas, projetos e disciplinas deste aparelho (a tabela de cursos e os modelos de e-mail ficam). */
+  async function apagarTudo() {
+    const n = db.turmas.length;
+    const ok = await confirmar('Apagar tudo', `Apagar as ${n} turma(s), os projetos, as disciplinas e o calendário letivo deste aparelho? Não tem volta. Se quiser guardar, salve antes um backup (menu ⋮).`, 'Apagar tudo', true);
+    if (!ok) return;
+    const ids = db.projetos.map(p => p.id);
+    db.turmas = []; db.projetos = []; db.disciplinas = [];
+    delete db.projetoPadrao;
+    ids.forEach(id => Pasta.esquecer('p:' + id).catch(() => {}));
+    gravarAgora(); go('#/');
+    toast(n + ' turma(s) apagada(s)');
   }
 
   async function restaurarBackup() {
