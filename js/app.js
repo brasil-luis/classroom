@@ -13,7 +13,7 @@
 (function () {
   'use strict';
   const CC = window.CC;
-  const VERSAO = '0.8.2';
+  const VERSAO = '0.9.0';
   const KEY = 'classroomcontrol.v1';
   const $ = sel => document.querySelector(sel);
   const app = $('#app');
@@ -1621,6 +1621,8 @@
   }
 
   async function importarNaTurma(t, p, nomeArq) {
+    // Planilha de correção de prova (notas por subitem): vai para uma avaliação, não para a chamada.
+    if (p.provas && p.provas.length && !p.datas.length) return importarProvas(t, p, nomeArq);
     if (!p.alunos.length) return toast(p.avisos[0] || 'Não encontrei alunos nessa planilha.');
     if (!p.datas.length && !p.cronograma.length && !p.notas.length && !p.notasApp) {
       // Só a lista: tratar como atualização da lista oficial.
@@ -2562,7 +2564,13 @@
     if (t.avaliacoes.length) {
       h += `<div class="card"><h3>Notas</h3>` + t.avaliacoes.map(v => {
         const n = (t.notas[v.id] || {})[a.id];
-        return `<div class="row small"><span class="grow">${esc(v.nome)}</span><b>${typeof n === 'number' ? CC.numBR(n, n % 1 ? 1 : 0) : '—'}</b><span class="muted">/ ${v.max}</span></div>`;
+        const d = v.detalhe && v.detalhe.alunos[a.id];
+        const linha = `<div class="row small"><span class="grow">${esc(v.nome)}${d && d.modelo ? ` <span class="muted">· modelo ${esc(d.modelo)}</span>` : ''}${d && d.situacao === 'Ausente' ? ' <span class="muted">· ausente</span>' : ''}</span><b>${typeof n === 'number' ? CC.numBR(n, n % 1 ? (Math.round(n * 10) === n * 10 ? 1 : 2) : 0) : '—'}</b><span class="muted">/ ${v.max}</span></div>`;
+        if (!d || d.situacao === 'Ausente') return linha;
+        const txts = Object.keys(d.textos || {});
+        return linha + `<div class="muted small" style="margin:-2px 0 6px 10px">${v.detalhe.questoes.map(q => `${esc(q.nome)} ${nb(CC.totalQuestao(v.detalhe, a.id, q))}/${nb(CC.maxQuestao(q))}`).join(' · ')}
+          ${Object.keys(d.extras || {}).map(k => ` · ${esc(k)}: ${esc(d.extras[k])}`).join('')}</div>
+          ${txts.length ? `<details class="small" style="margin:0 0 8px 10px"><summary>Correção comentada</summary>${txts.map(k => `<p style="margin:4px 0"><b>${esc(k)}:</b> ${esc(d.textos[k])}</p>`).join('')}</details>` : ''}`;
       }).join('') + '</div>';
     }
     h += `<div class="lista-chamada">` + (aulas.length ? aulas.map(aula => {
@@ -2670,6 +2678,172 @@
 
   /* ---------- tela: notas ---------- */
 
+  /* ---------- provas detalhadas (questões e subitens) ---------- */
+
+  const nb = x => (x == null ? '—' : CC.numBR(x, 2).replace(/,?0+$/, '').replace(/,$/, '') || '0');
+
+  /** Planilha de correção de uma prova (notas por subitem, critério, justificativas): escolhe a avaliação e importa. */
+  async function importarProvas(t, p, nomeArq) {
+    const provas = p.provas;
+    const blocos = provas.map((d, k) => {
+      const nItens = d.questoes.reduce((s, q) => s + q.itens.length, 0);
+      const max = d.questoes.reduce((s, q) => s + q.itens.reduce((x, it) => x + it.max, 0), 0);
+      const achados = d.linhas.filter(l => CC.findAluno(t, { matricula: l.matricula, nome: l.nome, email: l.email }, false));
+      const fora = d.linhas.filter(l => !achados.includes(l));
+      const padrao = t.avaliacoes.find(v => CC.norm(v.nome) === CC.norm(d.nome));
+      return `<fieldset class="grupo"><legend>${esc(d.nome || 'Prova ' + (k + 1))}</legend><div class="stack">
+        <p class="small" style="margin:0">${d.questoes.length} questão(ões), ${nItens} subitem(ns), valor máximo ${nb(max)} ·
+          ${achados.length} aluno(s) desta turma${fora.length ? `, <b>${fora.length} não encontrado(s)</b>` : ''}
+          ${d.textos && d.textos.length ? ' · com justificativas' : ''}${d.questoes.some(q => q.regra || q.itens.some(it => it.regra || it.descricao)) ? ' · com critério' : ''}</p>
+        ${fora.length ? `<details class="small muted"><summary>Não encontrados</summary>${fora.map(l => esc(l.nome || l.matricula)).join(', ')}</details>` : ''}
+        <label class="field">Avaliação<select name="av_${k}">
+          ${t.avaliacoes.map(v => `<option value="${v.id}" ${padrao === v ? 'selected' : ''}>${esc(v.nome)}${v.detalhe ? ' (já detalhada)' : ''}</option>`).join('')}
+          <option value="nova" ${padrao ? '' : 'selected'}>Nova avaliação “${esc(d.nome || 'Prova')}”</option></select></label></div></fieldset>`;
+    }).join('');
+    const r = await dialogo(`<h2>Notas detalhadas da prova</h2>
+      <p class="muted small">${esc(nomeArq)}: notas por questão e subitem${provas.some(d => d.textos && d.textos.length) ? ', critério e justificativas' : ''}. A nota da avaliação passa a ser a soma dos subitens.</p>
+      ${blocos}
+      <div class="checks"><label><input type="checkbox" name="substituir" checked> substituir o que já houver nessas avaliações (notas e detalhes)</label></div>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Importar</button></div>`);
+    if (r.acao !== 'ok') return;
+    const msgs = [];
+    provas.forEach((d, k) => {
+      let v = t.avaliacoes.find(x => x.id === r.dados['av_' + k]);
+      if (!v) {
+        v = { id: CC.uid('v'), nome: d.nome || 'Prova', tipo: 'normal', data: '', peso: 1, max: 10 };
+        t.avaliacoes.push(v);
+      }
+      if (r.dados.substituir) delete t.notas[v.id];
+      const res = CC.aplicarProvaDetalhada(t, v, d, { substituir: !!r.dados.substituir });
+      msgs.push(`${v.nome}: ${res.casados} aluno(s)` + (res.semAluno.length ? `, ${res.semAluno.length} não encontrado(s)` : '') +
+        (res.divergentes.length ? `, ${res.divergentes.length} com soma diferente da nota da planilha` : ''));
+      if (res.divergentes.length) console.warn('Somas diferentes', res.divergentes);
+    });
+    CC.sincronizarAvaliacoes(t);
+    salvar(); go(`#/t/${t.id}/notas/${(t.avaliacoes.find(x => x.id === r.dados.av_0) || t.avaliacoes[t.avaliacoes.length - 1]).id}`);
+    toast(msgs.join(' · '));
+  }
+
+  /** Questões e subitens da avaliação, em texto (cria ou altera o detalhamento). */
+  async function editarEstrutura(t, av) {
+    const det = av.detalhe;
+    const r = await dialogo(`<h2>Questões de ${esc(av.nome)}</h2>
+      <p class="muted small">Uma questão por linha: nome, dois-pontos e os subitens com o valor máximo, separados por ponto e vírgula.
+      A nota da avaliação passa a ser a soma dos subitens.</p>
+      <textarea name="estrutura" rows="8" style="font-family:monospace;font-size:14px" placeholder="Q1 — Fundamentos: 1a = 0,6; 1b = 0,5; 1c = 0,3; 1d = 0,6&#10;Q2 — Autômatos: 2a = 1; 2b = 1,1; 2c = 0,4&#10;Q3: 2,5">${esc(CC.estruturaParaTexto(det))}</textarea>
+      <p class="small" id="soma-estr"></p>
+      <div class="acoes">${det ? '<button class="btn danger" value="remover" formnovalidate>Tirar o detalhamento</button>' : ''}
+      <button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`,
+    form => {
+      const ta = form.querySelector('[name=estrutura]'), out = form.querySelector('#soma-estr');
+      const conta = () => {
+        const e = CC.textoParaEstrutura(ta.value.replace(/^([^:=\n]+):\s*([\d.,]+)\s*$/gm, '$1: $1 = $2'), det);
+        const soma = e.questoes.reduce((s, q) => s + q.itens.reduce((x, it) => x + it.max, 0), 0);
+        out.textContent = `${e.questoes.length} questão(ões) · valor máximo ${nb(Math.round(soma * 100) / 100)}` + (e.erros.length ? ` · ${e.erros.length} linha(s) não entendida(s)` : '');
+      };
+      ta.addEventListener('input', conta); conta();
+    });
+    if (r.acao === 'remover') {
+      if (await confirmar('Tirar o detalhamento', `As notas de ${esc(av.nome)} ficam como estão (a soma atual); as notas por subitem e as justificativas são apagadas.`, 'Tirar', true)) {
+        delete av.detalhe; salvar(); render();
+      }
+      return;
+    }
+    if (r.acao !== 'ok') return;
+    // "Q3: 2,5" (questão sem subitens) vira um subitem com o nome da questão.
+    const e = CC.textoParaEstrutura(String(r.dados.estrutura).replace(/^([^:=\n]+):\s*([\d.,]+)\s*$/gm, '$1: $1 = $2'), det);
+    if (!e.questoes.length) return toast('Nenhuma questão entendida.');
+    if (e.erros.length && !await confirmar('Linhas não entendidas', e.erros.map(esc).join('<br>'), 'Salvar assim')) return;
+    const ids = new Set(e.questoes.flatMap(q => q.itens.map(it => it.id)));
+    if (det) Object.values(det.alunos).forEach(d => Object.keys(d.itens).forEach(id => { if (!ids.has(id)) delete d.itens[id]; }));
+    av.detalhe = Object.assign(det || { alunos: {}, extras: [], textos: [] }, { questoes: e.questoes });
+    CC.sincronizarNotasDetalhe(t, av);
+    salvar(); render();
+  }
+
+  /** Critério de correção (descrição e regra de cada subitem). */
+  function verCriterio(av) {
+    const det = av.detalhe;
+    dialogo(`<h2>Critério — ${esc(av.nome)}</h2>${det.criterioNota ? `<p class="muted small">${esc(det.criterioNota)}</p>` : ''}
+      <div class="scroll">${det.questoes.map(q => `<h3 style="margin:12px 0 4px">${esc(q.nome)}${q.titulo ? ' — ' + esc(q.titulo) : ''} <span class="muted small">(${nb(CC.maxQuestao(q))})</span></h3>
+        ${q.descricao || q.regra ? `<p class="small" style="margin:0 0 6px">${esc(q.descricao || '')}${q.regra ? `<br><span class="muted">${esc(q.regra)}</span>` : ''}</p>` : ''}
+        <ul class="small" style="margin:0;padding-left:18px">${q.itens.map(it => `<li><b>${esc(it.nome)}</b> (${nb(it.max)})${it.descricao ? ' — ' + esc(it.descricao) : ''}${it.regra ? `<br><span class="muted">${esc(it.regra)}</span>` : ''}</li>`).join('')}</ul>`).join('')}</div>
+      <div class="acoes"><button class="btn primary" value="">Fechar</button></div>`);
+  }
+
+  /** Notas de um aluno numa prova detalhada: subitens, situação, modelo, colunas extras e justificativas. */
+  async function editarProvaAluno(t, av, a) {
+    const det = av.detalhe;
+    const d = det.alunos[a.id] || { situacao: 'Presente', modelo: '', itens: {}, extras: {}, textos: {} };
+    const textos = det.textos && det.textos.length ? det.textos : det.questoes.map(q => q.nome).concat('Observações');
+    const modelos = Array.from(new Set(Object.values(det.alunos).map(x => x.modelo).filter(Boolean))).sort();
+    const r = await dialogo(`<h2>${esc(nomeCurto(a.nome))} — ${esc(av.nome)}</h2><div class="stack">
+      <div class="row nowrap"><label class="field grow">Situação<select name="situacao"><option ${d.situacao !== 'Ausente' ? 'selected' : ''}>Presente</option><option ${d.situacao === 'Ausente' ? 'selected' : ''}>Ausente</option></select></label>
+      <label class="field grow">Modelo<input type="text" name="modelo" list="modelos-prova" value="${esc(d.modelo || '')}"></label></div>
+      <datalist id="modelos-prova">${modelos.map(m => `<option value="${esc(m)}">`).join('')}</datalist>
+      ${det.questoes.map(q => `<fieldset class="grupo"><legend>${esc(q.nome)}${q.titulo ? ' — ' + esc(q.titulo) : ''} <span class="muted small" data-totq="${esc(q.nome)}"></span></legend>
+        <div class="row">${q.itens.map(it => `<label class="field" style="width:5.5em">${esc(it.nome)} <span class="muted small">/ ${nb(it.max)}</span>
+          <input type="text" inputmode="decimal" name="it_${it.id}" data-max="${it.max}" value="${typeof d.itens[it.id] === 'number' ? String(d.itens[it.id]).replace('.', ',') : ''}"></label>`).join('')}</div>
+        ${textos.includes(q.nome) ? `<textarea name="tx_${esc(q.nome)}" rows="2" placeholder="Justificativa">${esc((d.textos || {})[q.nome] || '')}</textarea>` : ''}</fieldset>`).join('')}
+      ${(det.extras || []).map(e => `<label class="field">${esc(e)}<input type="text" name="ex_${esc(e)}" value="${esc((d.extras || {})[e] || '')}"></label>`).join('')}
+      ${textos.filter(k => !det.questoes.some(q => q.nome === k)).map(k => `<label class="field">${esc(k)}<textarea name="tx_${esc(k)}" rows="2">${esc((d.textos || {})[k] || '')}</textarea></label>`).join('')}
+      <p class="small"><b id="tot-prova"></b></p></div>
+      <div class="acoes"><button class="btn" value="">Cancelar</button><button class="btn primary" value="ok">Salvar</button></div>`,
+    form => {
+      const conta = () => {
+        let tot = 0, algum = false;
+        det.questoes.forEach(q => {
+          let tq = 0, aq = false;
+          q.itens.forEach(it => { const x = parseFloat(String(form.querySelector(`[name="it_${it.id}"]`).value).replace(',', '.')); if (!isNaN(x)) { tq += x; aq = true; } });
+          const el = form.querySelector(`[data-totq="${CSS.escape(q.nome)}"]`);
+          if (el) el.textContent = aq ? `${nb(Math.round(tq * 100) / 100)} / ${nb(CC.maxQuestao(q))}` : '';
+          tot += tq; algum = algum || aq;
+        });
+        const aus = form.querySelector('[name=situacao]').value === 'Ausente';
+        form.querySelector('#tot-prova').textContent = aus ? 'Ausente: sem nota' : algum ? `Nota: ${nb(Math.round(tot * 100) / 100)} de ${nb(CC.maxDetalhe(det))}` : '';
+      };
+      form.addEventListener('input', conta); form.addEventListener('change', conta); conta();
+    });
+    if (r.acao !== 'ok') return;
+    const nd = { situacao: r.dados.situacao === 'Ausente' ? 'Ausente' : 'Presente', modelo: String(r.dados.modelo || '').trim(), itens: {}, extras: {}, textos: {} };
+    let erro = '';
+    CC.itensDe(det).forEach(it => {
+      const s = String(r.dados['it_' + it.id] || '').trim().replace(',', '.');
+      if (!s) return;
+      const x = parseFloat(s);
+      if (isNaN(x) || x < 0 || x > it.max + 1e-9) erro = `${it.q.nome} ${it.nome}: nota de 0 a ${nb(it.max)}`;
+      else nd.itens[it.id] = x;
+    });
+    if (erro) return toast(erro);
+    (det.extras || []).forEach(e => { const v = String(r.dados['ex_' + e] || '').trim(); if (v) nd.extras[e] = v; });
+    textos.forEach(k => { const v = String(r.dados['tx_' + k] || '').trim(); if (v) nd.textos[k] = v; });
+    det.alunos[a.id] = nd;
+    CC.sincronizarNotasDetalhe(t, av);
+    salvar(); render();
+  }
+
+  /** Tela da avaliação detalhada: resumo por questão e alunos com o total de cada questão. */
+  function htmlProvaDetalhada(t, av) {
+    const det = av.detalhe, est = CC.estatisticasProva(t, av);
+    const pct = (m, x) => (m != null && x ? Math.round(m / x * 100) + '%' : '—');
+    let h = `<div class="card"><div class="row"><div class="grow"><b>${det.questoes.length} questão(ões)</b> · máx. ${nb(est.max)}
+        <div class="muted small">${est.presentes} com nota · ${est.ausentes} ausente(s)${est.geral ? ` · média ${nb(est.geral.media)} (${nb(est.geral.menor)} a ${nb(est.geral.maior)})` : ''}</div></div>
+        <button class="btn small" id="criterio">Critério</button><button class="btn small" id="estrutura">Questões</button></div>
+      <div class="tabela-wrap"><table class="small"><thead><tr><th>Questão</th><th class="num">Máx.</th><th class="num">Média</th><th class="num">%</th><th class="num">Zeros</th></tr></thead><tbody>
+      ${est.questoes.map(x => `<tr><td>${esc(x.q.nome)}${x.q.titulo ? ' <span class="muted">' + esc(x.q.titulo) + '</span>' : ''}</td><td class="num">${nb(x.max)}</td><td class="num">${nb(x.media)}</td><td class="num">${pct(x.media, x.max)}</td><td class="num">${x.zeros == null ? '—' : x.zeros}</td></tr>`).join('')}
+      </tbody></table></div>
+      ${est.modelos.length > 1 ? `<p class="muted small" style="margin:6px 0 0">Por modelo: ${est.modelos.map(m => `${esc(m.modelo)} ${nb(m.media)} (${m.n})`).join(' · ')}</p>` : ''}</div>
+      <div class="tabela-wrap"><table><thead><tr><th>Aluno</th>${det.questoes.map(q => `<th class="num">${esc(q.nome)}</th>`).join('')}<th class="num">${esc(av.nome)}</th></tr></thead><tbody>`;
+    h += CC.alunosOrdenados(t, false).map(a => {
+      const d = det.alunos[a.id];
+      const aus = d && d.situacao === 'Ausente';
+      const tot = CC.totalAluno(det, a.id);
+      return `<tr data-prova="${a.id}" style="cursor:pointer"><td class="nome-cel">${esc(nomeCurto(a.nome))}${d && d.modelo ? ` <span class="muted small">${esc(d.modelo)}</span>` : ''}${d && (d.extras || {}).Alertas ? ' <span class="tag VS">!</span>' : ''}</td>
+        ${aus ? `<td colspan="${det.questoes.length + 1}" class="muted small">ausente</td>` : det.questoes.map(q => `<td class="num">${nb(CC.totalQuestao(det, a.id, q))}</td>`).join('') + `<td class="num"><b>${nb(tot)}</b></td>`}</tr>`;
+    }).join('') + '</tbody></table></div>';
+    return h;
+  }
+
   function telaNotas(t, avId) {
     const avs = t.avaliacoes;
     let listaNotas = null;
@@ -2690,12 +2864,12 @@
       const notas = t.notas[av.id] || {};
       h += `<div class="card"><div class="row"><div class="grow"><h3>${esc(av.nome)}</h3>
         <div class="muted small">nota de 0 a ${av.max}${av.data ? ' · ' + CC.fmtDate(av.data, true) : ''} · ${av.tipo === 'VR' ? 'substitui a prova perdida' : av.tipo === 'VS' ? 'suplementar' : 'peso ' + CC.numBR(av.peso, av.peso % 1 ? 1 : 0)}</div></div>
-        <button class="btn small" id="edit-av">Editar</button></div></div>
-        <div class="lista-chamada">` + CC.alunosOrdenados(t, false).map(a => {
+        ${av.detalhe ? '' : '<button class="btn small" id="detalhar">Detalhar por questões</button>'}<button class="btn small" id="edit-av">Editar</button></div></div>` +
+        (av.detalhe ? htmlProvaDetalhada(t, av) : `<div class="lista-chamada">` + CC.alunosOrdenados(t, false).map(a => {
         const n = notas[a.id];
         return `<div class="aluno-row"><div class="nome">${esc(nomeCurto(a.nome))}<div class="det">${esc(a.matricula)}</div></div>
           <input type="text" inputmode="decimal" class="nota-input" data-aluno="${a.id}" value="${typeof n === 'number' ? String(n).replace('.', ',') : ''}" enterkeyhint="next"></div>`;
-      }).join('') + '</div>';
+      }).join('') + '</div>');
     } else if (avs.length) {
       const lista = CC.alunosVisao(t, visaoDe(t), a => cursoDe(t, a));
       h += cartaoEstatisticas(t) + barraVisao(t, CC.alunosOrdenados(t, false).length, lista) + tabelaNotas(t, lista);
@@ -2711,6 +2885,12 @@
     }
     if (av) {
       $('#edit-av').onclick = () => editarAvaliacao(t, av);
+      const dt = $('#detalhar'); if (dt) dt.onclick = () => editarEstrutura(t, av);
+      if (av.detalhe) {
+        $('#criterio').onclick = () => verCriterio(av);
+        $('#estrutura').onclick = () => editarEstrutura(t, av);
+        app.querySelectorAll('tr[data-prova]').forEach(tr => tr.onclick = () => editarProvaAluno(t, av, t.alunos.find(a => a.id === tr.dataset.prova)));
+      }
       const inputs = Array.from(app.querySelectorAll('.nota-input'));
       inputs.forEach((inp, k) => {
         inp.addEventListener('change', () => {
@@ -2846,7 +3026,7 @@
     }
   } catch (e) { /* sem sessionStorage */ }
   // Ganchos para depuração no console.
-  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma, importarNovaTurma, importarPasta, entradasDoZip, linhasDoPDF, lerCalendarioPDF };
+  window.__cc = { get db() { return db; }, salvar, render, cursos, importarVarias, atualizarVariasListas, escolherColunas, importarNaTurma, importarProvas, importarNovaTurma, importarPasta, entradasDoZip, linhasDoPDF, lerCalendarioPDF };
   // O IndexedDB pode ter dados mais novos (ou os únicos, quando não couberam no localStorage).
   if (window.indexedDB) {
     idbLer().then(json => {

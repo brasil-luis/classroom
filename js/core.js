@@ -251,6 +251,11 @@
       }
     }
 
+    // Notas por questão/subitem de uma prova (planilha de correção ou abas exportadas pelo app).
+    if (g.CC.lerProvasDetalhadas) {
+      try { const pr = g.CC.lerProvasDetalhadas(XLSX, wb); if (pr.length) result.provas = pr; } catch (e) { /* formato inesperado */ }
+    }
+
     if (!main) {
       result.avisos.push('Não encontrei uma linha de cabeçalho com "Matrícula" e "Nome".');
       return result;
@@ -804,6 +809,13 @@
           const notas = t.notas[v.id] || (t.notas[v.id] = {});
           if (notas[a.id] == null) { notas[a.id] = dado.notas[nome]; res.notas++; }
         });
+      });
+    }
+    // Provas detalhadas (abas "P1 detalhe", "P1 critério"…): vão para a avaliação de mesmo nome que ainda não tem detalhe.
+    if (o.notasApp && parsed.provas && g.CC.aplicarProvaDetalhada) {
+      parsed.provas.forEach(d => {
+        const v = t.avaliacoes.find(x => norm(x.nome) === norm(d.nome));
+        if (v && !v.detalhe) g.CC.aplicarProvaDetalhada(t, v, d, { substituir: false });
       });
     }
 
@@ -1860,6 +1872,9 @@
     ob['!rows'] = [{ hpt: 24 }];
     U.book_append_sheet(wb, ob, 'Observações');
 
+    // ---- Provas detalhadas (questões e subitens): abas "<prova> detalhe", "<prova> critério", "<prova> justificativas"
+    if (g.CC.abasProvas) g.CC.abasProvas(XLSX, wb, t, alunos);
+
     // ---- Configuração
     const cfg = {};
     put(cfg, 0, 0, s(titulo, ST.titulo()));
@@ -1953,6 +1968,7 @@
   }
 
   g.CC = {
+    _xl: { estilo, ST, corpo, COR, sheetName, isoToSerial }, sheetMatrix,
     STATUS, STATUS_LABEL, TIPOS, TIPOS_AVALIACAO, DIAS, DEFAULT_CONFIG,
     uid, norm, titleCase, todayISO, addDays, weekday, fmtDate, cellToISO, numBR,
     parseWorkbook, novaTurma, nomeTurma, disciplinaTema, turmaDePlanilha, corrigirMatriculasAntigas, cpfAluno, mesmaPessoa, historicoAluno, pessoasDe, dataNoNome, ehUFF, categoriaPadrao, aplicarCategorias, alunosOrdenados, aulasOrdenadas, findAluno,

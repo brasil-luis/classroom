@@ -3,10 +3,17 @@
 App web instalável (PWA) para fazer chamada pelo celular Android e organizar a turma.
 Funciona offline; os dados ficam só no aparelho.
 
-**Versão 0.8.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
+**Versão 0.9.0** — a numeração fica em 0.x até o app ter todas as funcionalidades
 planejadas; aí vira 1.0.
 
 ## O que faz
+- **Provas detalhadas**: cada avaliação pode ter questões e subitens (valor máximo, descrição e regra de
+  pontuação), a nota de cada aluno por subitem, o modelo da prova, presença, colunas extras (ex.: Lápis,
+  Alertas) e as justificativas da correção. A nota da avaliação é a soma dos subitens. Importa a planilha de
+  correção (abas Notas com a linha "Valor máximo", Critério e Justificativas) pelo menu da turma → Importar;
+  no app, as questões são definidas em texto (`Q1 — Fundamentos: 1a = 0,6; 1b = 0,5`) e as notas lançadas
+  por aluno. A tela da prova mostra média por questão e por modelo; a planilha exportada ganha as abas
+  "P1 detalhe", "P1 estatísticas", "P1 critério" e "P1 justificativas", que voltam ao importar.
 - **Projetos, disciplinas e turmas.** Um projeto é uma instituição (e, se quiser, um departamento):
   guarda as regras das turmas (frequência mínima, peso do atraso, médias) e o calendário letivo. Cada
   disciplina (código, nome, sigla, nível graduação/pós/outro, se aceita avulsos) guarda a carga horária
@@ -118,6 +125,7 @@ e abra `http://localhost:8765/`.
 
 - `js/core.js` — lógica (leitura de planilhas, mesclagem, estatísticas, exportação)
 - `js/projetos.js` — projetos, disciplinas e calendário letivo (feriados, leitura do PDF do calendário)
+- `js/provas.js` — provas detalhadas (questões, subitens, critério, justificativas)
 - `js/app.js` — interface
 - `js/ocr.js` — leitura de folhas por foto (preparo da imagem, OCR, detecção de assinatura)
 - `js/pasta.js` — pasta de trabalho (File System Access API)
